@@ -9,6 +9,7 @@ import { supabase, supabaseConfigurado } from "./lib/supabaseClient";
 import { entrarComEmailSenha, obterPerfilSupabase, sairDoSupabase } from "./services/supabaseAuth";
 import {
   buscarUsuarioSistemaOnline,
+  buscarUsuarioSistemaOnlinePorAluno,
   listarAlunosOnline,
   listarPagamentosOnline,
   listarPresencasOnline,
@@ -18,6 +19,7 @@ import {
   registrarPresencaOnline,
   removerAlunoOnline,
   removerUsuarioSistemaOnlinePorAluno,
+  enviarArquivoOnline,
   salvarAlunoOnline,
   salvarPagamentoOnline,
   salvarUsuarioSistemaOnline,
@@ -25,6 +27,9 @@ import {
 
 const APP_NAME = "Ariramba Jiu-Jitsu School";
 const DIA_COBRANCA_PADRAO = 27;
+const TAMANHO_FOTO_AJUSTADA = 640;
+const TAMANHO_PREVIEW_FOTO = 300;
+const QUALIDADE_FOTO_AJUSTADA = 0.84;
 
 const STORAGE_KEYS = {
   alunos: "alunos_ariramba_jiu_jitsu_school",
@@ -61,9 +66,13 @@ function salvarDados(chave, valor) {
 }
 
 function normalizarAluno(aluno) {
+  const fotoAluno = aluno.foto || aluno.fotoUrl || aluno.foto_url || "";
+
   return {
     ...aluno,
     turma: aluno.turma || "Adultos",
+    foto: fotoAluno,
+    fotoUrl: aluno.fotoUrl || aluno.foto_url || fotoAluno,
     presencas: Array.isArray(aluno.presencas) ? aluno.presencas : [],
     historicoPagamentos: Array.isArray(aluno.historicoPagamentos)
       ? aluno.historicoPagamentos
@@ -228,10 +237,30 @@ function normalizarTextoBusca(valor) {
 function carregarImagem(src) {
   return new Promise((resolve, reject) => {
     const imagem = new Image();
-    imagem.onload = () => resolve(imagem);
-    imagem.onerror = reject;
+
+    const timeout = setTimeout(() => {
+      reject(new Error("Imagem demorou demais para carregar."));
+    }, 8000);
+
+    imagem.onload = () => {
+      clearTimeout(timeout);
+      resolve(imagem);
+    };
+    imagem.onerror = (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    };
     imagem.src = src;
   });
+}
+
+function normalizarNomeArquivo(valor) {
+  return String(valor || "aluno")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase() || "aluno";
 }
 
 async function prepararFotoCarteirinha(src) {
@@ -301,6 +330,28 @@ function lerImagemCompactada(arquivo) {
     };
     leitor.readAsDataURL(arquivo);
   });
+}
+
+function converterDataUrlParaBlob(dataUrl) {
+  const [cabecalho, conteudoBase64] = String(dataUrl || "").split(",");
+
+  if (!cabecalho?.startsWith("data:image/") || !conteudoBase64) {
+    throw new Error("Foto do professor invalida.");
+  }
+
+  const tipo = cabecalho.match(/data:(.*?);base64/)?.[1] || "image/jpeg";
+  const binario = atob(conteudoBase64);
+  const bytes = new Uint8Array(binario.length);
+
+  for (let indice = 0; indice < binario.length; indice += 1) {
+    bytes[indice] = binario.charCodeAt(indice);
+  }
+
+  return new Blob([bytes], { type: tipo });
+}
+
+function fotoProfessorPrecisaUpload(fotoProfessor) {
+  return String(fotoProfessor || "").startsWith("data:image/");
 }
 
 function aplicarPagamentosNosAlunos(alunos, pagamentos) {
@@ -428,8 +479,282 @@ async function desfazerAlunoOnlineCriado(idAluno) {
   }
 }
 
+function ModalMensagem({ modal, onFechar }) {
+  if (!modal) return null;
+
+  const tipo = modal.tipo || "informacao";
+  const titulo = modal.titulo || "Mensagem";
+  const mensagem = modal.mensagem || "";
+  const botao = modal.botao || "OK";
+
+  return (
+    <div className="modalMensagemFundo" role="presentation">
+      <div
+        className={`modalMensagem modalMensagem-${tipo}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="modalMensagemTitulo"
+      >
+        <span className="modalMensagemIndicador" aria-hidden="true"></span>
+
+        <h2 id="modalMensagemTitulo">{titulo}</h2>
+
+        <p>{mensagem}</p>
+
+        <button type="button" onClick={onFechar}>
+          {botao}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function limitarNumero(valor, minimo, maximo) {
+  return Math.min(Math.max(valor, minimo), maximo);
+}
+
+function calcularLimitesAjusteFoto(larguraImagem, alturaImagem, tamanhoPreview, zoom) {
+  if (!larguraImagem || !alturaImagem || !tamanhoPreview) {
+    return { limiteX: 0, limiteY: 0 };
+  }
+
+  const escalaBase = Math.max(
+    tamanhoPreview / larguraImagem,
+    tamanhoPreview / alturaImagem
+  );
+  const larguraExibida = larguraImagem * escalaBase * zoom;
+  const alturaExibida = alturaImagem * escalaBase * zoom;
+
+  return {
+    limiteX: Math.max(0, (larguraExibida - tamanhoPreview) / 2),
+    limiteY: Math.max(0, (alturaExibida - tamanhoPreview) / 2),
+  };
+}
+
+function AjustadorFoto({
+  foto,
+  zoom,
+  posicaoX,
+  posicaoY,
+  onZoom,
+  onPosicaoX,
+  onPosicaoY,
+  onTamanhoPreview,
+  onCancelar,
+  onConfirmar,
+}) {
+  const previewRef = useRef(null);
+  const arrastandoRef = useRef(false);
+  const inicioArrasteRef = useRef({ x: 0, y: 0, posicaoX: 0, posicaoY: 0 });
+  const [dimensoesImagem, setDimensoesImagem] = useState({ largura: 0, altura: 0 });
+  const [tamanhoPreviewAtual, setTamanhoPreviewAtual] = useState(TAMANHO_PREVIEW_FOTO);
+
+  function limitarPosicao(proximaPosicaoX, proximaPosicaoY, proximoZoom = zoom) {
+    const { limiteX, limiteY } = calcularLimitesAjusteFoto(
+      dimensoesImagem.largura,
+      dimensoesImagem.altura,
+      tamanhoPreviewAtual,
+      proximoZoom
+    );
+
+    return {
+      x: limitarNumero(proximaPosicaoX, -limiteX, limiteX),
+      y: limitarNumero(proximaPosicaoY, -limiteY, limiteY),
+    };
+  }
+
+  function alterarZoom(event) {
+    const proximoZoom = Number(event.target.value);
+    const posicaoLimitada = limitarPosicao(posicaoX, posicaoY, proximoZoom);
+
+    onZoom(proximoZoom);
+    onPosicaoX(posicaoLimitada.x);
+    onPosicaoY(posicaoLimitada.y);
+  }
+
+  function alterarPosicaoX(event) {
+    const posicaoLimitada = limitarPosicao(Number(event.target.value), posicaoY);
+    onPosicaoX(posicaoLimitada.x);
+  }
+
+  function alterarPosicaoY(event) {
+    const posicaoLimitada = limitarPosicao(posicaoX, Number(event.target.value));
+    onPosicaoY(posicaoLimitada.y);
+  }
+
+  function iniciarArraste(event) {
+    event.preventDefault();
+    arrastandoRef.current = true;
+    inicioArrasteRef.current = {
+      x: event.clientX,
+      y: event.clientY,
+      posicaoX,
+      posicaoY,
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  }
+
+  function moverArraste(event) {
+    if (!arrastandoRef.current) return;
+
+    const deltaX = event.clientX - inicioArrasteRef.current.x;
+    const deltaY = event.clientY - inicioArrasteRef.current.y;
+    const posicaoLimitada = limitarPosicao(
+      inicioArrasteRef.current.posicaoX + deltaX,
+      inicioArrasteRef.current.posicaoY + deltaY
+    );
+
+    onPosicaoX(posicaoLimitada.x);
+    onPosicaoY(posicaoLimitada.y);
+  }
+
+  function finalizarArraste(event) {
+    arrastandoRef.current = false;
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+  }
+
+  useEffect(() => {
+    const elementoPreview = previewRef.current;
+    if (!elementoPreview) return undefined;
+
+    function atualizarTamanhoPreview() {
+      const proximoTamanho = elementoPreview.clientWidth || TAMANHO_PREVIEW_FOTO;
+      setTamanhoPreviewAtual(proximoTamanho);
+      onTamanhoPreview?.(proximoTamanho);
+    }
+
+    atualizarTamanhoPreview();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", atualizarTamanhoPreview);
+      return () => window.removeEventListener("resize", atualizarTamanhoPreview);
+    }
+
+    const observer = new ResizeObserver(atualizarTamanhoPreview);
+    observer.observe(elementoPreview);
+
+    return () => observer.disconnect();
+  }, [onTamanhoPreview]);
+
+  const { limiteX, limiteY } = calcularLimitesAjusteFoto(
+    dimensoesImagem.largura,
+    dimensoesImagem.altura,
+    tamanhoPreviewAtual,
+    zoom
+  );
+  const escalaBasePreview =
+    dimensoesImagem.largura && dimensoesImagem.altura
+      ? Math.max(
+        tamanhoPreviewAtual / dimensoesImagem.largura,
+        tamanhoPreviewAtual / dimensoesImagem.altura
+      )
+      : 1;
+  const larguraImagemPreview = dimensoesImagem.largura * escalaBasePreview;
+  const alturaImagemPreview = dimensoesImagem.altura * escalaBasePreview;
+
+  return (
+    <div className="ajustadorFotoOverlay" role="presentation">
+      <div
+        className="ajustadorFotoModal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="ajustadorFotoTitulo"
+      >
+        <h2 id="ajustadorFotoTitulo">Ajustar foto</h2>
+
+        <div
+          ref={previewRef}
+          className="ajustadorFotoPreview"
+          onPointerDown={iniciarArraste}
+          onPointerMove={moverArraste}
+          onPointerUp={finalizarArraste}
+          onPointerCancel={finalizarArraste}
+        >
+          <img
+            src={foto}
+            alt="Ajustar enquadramento"
+            draggable="false"
+            onLoad={(event) => {
+              setDimensoesImagem({
+                largura: event.currentTarget.naturalWidth,
+                altura: event.currentTarget.naturalHeight,
+              });
+            }}
+            style={{
+              width: larguraImagemPreview ? `${larguraImagemPreview}px` : "100%",
+              height: alturaImagemPreview ? `${alturaImagemPreview}px` : "100%",
+              transform: `translate(-50%, -50%) translate(${posicaoX}px, ${posicaoY}px) scale(${zoom})`,
+              transformOrigin: "center center",
+            }}
+          />
+          <span className="ajustadorFotoGrade" aria-hidden="true"></span>
+        </div>
+
+        <label>
+          Zoom
+          <input
+            type="range"
+            min="1"
+            max="3"
+            step="0.05"
+            value={zoom}
+            onChange={alterarZoom}
+          />
+        </label>
+
+        <label>
+          Horizontal
+          <input
+            type="range"
+            min={-limiteX}
+            max={limiteX}
+            step="1"
+            value={posicaoX}
+            onChange={alterarPosicaoX}
+          />
+        </label>
+
+        <label>
+          Vertical
+          <input
+            type="range"
+            min={-limiteY}
+            max={limiteY}
+            step="1"
+            value={posicaoY}
+            onChange={alterarPosicaoY}
+          />
+        </label>
+
+        <div className="ajustadorFotoAcoes">
+          <button type="button" onClick={onCancelar}>
+            Cancelar
+          </button>
+
+          <button type="button" onClick={onConfirmar}>
+            Confirmar posição
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function App() {
-  const [tela, setTela] = useState("inicio");
+  const [tela, setTelaBase] = useState("inicio");
+  const posicoesScrollPorTelaRef = useRef({});
+  const telaAtualRef = useRef("inicio");
+
+  function setTela(proximaTela) {
+    const destino =
+      typeof proximaTela === "function"
+        ? proximaTela(telaAtualRef.current)
+        : proximaTela;
+
+    posicoesScrollPorTelaRef.current[telaAtualRef.current] = window.scrollY;
+    telaAtualRef.current = destino;
+    setTelaBase(destino);
+  }
 
   const [usuario, setUsuario] = useState("");
   const [senha, setSenha] = useState("");
@@ -550,10 +875,20 @@ function App() {
   const [observacoes, setObservacoes] = useState("");
   const [observacaoFinanceira, setObservacaoFinanceira] = useState("");
   const [foto, setFoto] = useState("");
+
+  const [fotoParaAjustar, setFotoParaAjustar] = useState("");
+  const [ajusteFotoAberto, setAjusteFotoAberto] = useState(false);
+  const [zoomFoto, setZoomFoto] = useState(1);
+  const [posicaoFotoX, setPosicaoFotoX] = useState(0);
+  const [posicaoFotoY, setPosicaoFotoY] = useState(0);
+  const [tamanhoPreviewFoto, setTamanhoPreviewFoto] = useState(TAMANHO_PREVIEW_FOTO);
+
   const [alunoCarteirinha, setAlunoCarteirinha] = useState(null);
   const [mostrarPix, setMostrarPix] = useState(false);
   const [imagemComprovante, setImagemComprovante] = useState(null);
   const [nomeComprovanteSelecionado, setNomeComprovanteSelecionado] = useState("");
+  const [comprovanteSelecionado, setComprovanteSelecionado] = useState(null);
+  const [pagamentoEmAndamento, setPagamentoEmAndamento] = useState(false);
   const [menuAberto, setMenuAberto] = useState(false);
   const [mostrarCarteirinhaAluno, setMostrarCarteirinhaAluno] = useState(false);
   const [mostrarHistoricoAluno, setMostrarHistoricoAluno] = useState(false);
@@ -568,10 +903,13 @@ function App() {
   const [alunoEditando, setAlunoEditando] = useState(null);
   const [sincronizacaoOnline, setSincronizacaoOnline] = useState("");
   const [loginEmAndamento, setLoginEmAndamento] = useState(false);
+  const [modalMensagem, setModalMensagem] = useState(null);
   const [salvandoAluno, setSalvandoAluno] = useState(false);
   const [statusScanner, setStatusScanner] = useState("Abrindo camera...");
   const [scannerKey, setScannerKey] = useState(0);
   const [nomeArquivoScanner, setNomeArquivoScanner] = useState("");
+  const pagamentoEmAndamentoRef = useRef(false);
+  const contextoFotoTemporariaRef = useRef("");
   const registrarPresencaPorQRCodeRef = useRef(null);
   const [horaAtual, setHoraAtual] = useState(
     new Date().toLocaleTimeString()
@@ -587,6 +925,170 @@ function App() {
       usuarioLogado?.origem === "usuarios_sistema");
   const modoLocalAtivo = !supabaseConfigurado;
 
+  function obterContextoFotoAtual() {
+    if (tela === "cadastro") {
+      return alunoEditando
+        ? `cadastro-aluno:${alunoEditando.id}`
+        : "cadastro-aluno:novo";
+    }
+
+    if (tela === "portalProfessor") {
+      return `portal-professor:${usuarioLogado?.id || usuarioLogado?.usuario || ""}`;
+    }
+
+    if (tela === "portalAluno") {
+      return `portal-aluno:${alunoDoPortal?.id || usuarioLogado?.alunoId || usuarioLogado?.usuario || ""}`;
+    }
+
+    return "";
+  }
+
+  function fotoTemporariaPertenceAoContextoAtual() {
+    return (
+      String(foto || "").startsWith("data:image/") &&
+      contextoFotoTemporariaRef.current === obterContextoFotoAtual()
+    );
+  }
+
+  function definirFotoTemporaria(fotoTemporaria) {
+    contextoFotoTemporariaRef.current = obterContextoFotoAtual();
+    setFoto(fotoTemporaria);
+  }
+
+  function abrirAjusteFoto(fotoSelecionada) {
+    setFotoParaAjustar(fotoSelecionada);
+    setZoomFoto(1);
+    setPosicaoFotoX(0);
+    setPosicaoFotoY(0);
+    setTamanhoPreviewFoto(TAMANHO_PREVIEW_FOTO);
+    setAjusteFotoAberto(true);
+  }
+
+  async function prepararFotoParaAjuste(arquivo) {
+    try {
+      const fotoCompactada = await lerImagemCompactada(arquivo);
+      abrirAjusteFoto(fotoCompactada);
+    } catch (error) {
+      abrirModalMensagem({
+        tipo: "erro",
+        titulo: "Erro ao carregar foto",
+        mensagem: error.message || "Não foi possível carregar a foto.",
+      });
+    }
+  }
+
+  function cancelarAjusteFoto() {
+    setAjusteFotoAberto(false);
+    setFotoParaAjustar("");
+    setZoomFoto(1);
+    setPosicaoFotoX(0);
+    setPosicaoFotoY(0);
+    setTamanhoPreviewFoto(TAMANHO_PREVIEW_FOTO);
+  }
+
+  async function confirmarAjusteFoto() {
+    if (!fotoParaAjustar) return;
+
+    try {
+      const imagem = new Image();
+      imagem.crossOrigin = "anonymous";
+
+      imagem.onload = () => {
+        const tamanhoSaida = TAMANHO_FOTO_AJUSTADA;
+        const tamanhoPreview = tamanhoPreviewFoto || TAMANHO_PREVIEW_FOTO;
+
+        const canvas = document.createElement("canvas");
+        canvas.width = tamanhoSaida;
+        canvas.height = tamanhoSaida;
+
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#111827";
+        ctx.fillRect(0, 0, tamanhoSaida, tamanhoSaida);
+
+        const escalaBase = Math.max(
+          tamanhoPreview / imagem.width,
+          tamanhoPreview / imagem.height
+        );
+
+        const escalaFinal = escalaBase * zoomFoto;
+
+        const larguraExibida = imagem.width * escalaFinal;
+        const alturaExibida = imagem.height * escalaFinal;
+
+        const fatorSaida = tamanhoSaida / tamanhoPreview;
+
+        const x =
+          (tamanhoPreview / 2 -
+            larguraExibida / 2 +
+            posicaoFotoX) *
+          fatorSaida;
+
+        const y =
+          (tamanhoPreview / 2 -
+            alturaExibida / 2 +
+            posicaoFotoY) *
+          fatorSaida;
+
+        ctx.drawImage(
+          imagem,
+          x,
+          y,
+          larguraExibida * fatorSaida,
+          alturaExibida * fatorSaida
+        );
+
+        const fotoRecortada = canvas.toDataURL("image/jpeg", QUALIDADE_FOTO_AJUSTADA);
+
+        definirFotoTemporaria(fotoRecortada);
+        cancelarAjusteFoto();
+      };
+
+      imagem.onerror = () => {
+        abrirModalMensagem({
+          tipo: "erro",
+          titulo: "Erro ao ajustar foto",
+          mensagem: "Não foi possível processar a imagem.",
+        });
+      };
+
+      imagem.src = fotoParaAjustar;
+    } catch (error) {
+      abrirModalMensagem({
+        tipo: "erro",
+        titulo: "Erro ao ajustar foto",
+        mensagem: error.message || "Não foi possível ajustar a foto.",
+      });
+    }
+  }
+
+  function abrirModalMensagem({
+    tipo = "informacao",
+    titulo = "Mensagem",
+    mensagem = "",
+    botao = "OK",
+    aoFechar = null,
+  }) {
+    setModalMensagem({ tipo, titulo, mensagem, botao, aoFechar });
+  }
+
+  function fecharModalMensagem() {
+    const aoFechar = modalMensagem?.aoFechar;
+    setModalMensagem(null);
+
+    if (typeof aoFechar === "function") {
+      aoFechar();
+    }
+  }
+
+  function avisarPrimeiroAcesso() {
+    abrirModalMensagem({
+      tipo: "aviso",
+      titulo: "Primeiro acesso",
+      mensagem: "Por segurança, crie uma nova senha antes de continuar.",
+      botao: "Continuar",
+    });
+  }
+
   useEffect(() => {
     if (menuAberto) {
       document.body.style.overflow = "hidden";
@@ -598,6 +1100,24 @@ function App() {
       document.body.style.overflow = "auto";
     };
   }, [menuAberto]);
+
+  useEffect(() => {
+    const posicaoSalva = posicoesScrollPorTelaRef.current[tela];
+    const posicaoDestino =
+      typeof posicaoSalva === "number" ? posicaoSalva : 0;
+    const frame = requestAnimationFrame(() => {
+      window.scrollTo(0, posicaoDestino);
+    });
+
+    return () => cancelAnimationFrame(frame);
+  }, [tela]);
+
+  useEffect(() => {
+    if (tela === "cadastro" && !alunoEditando) {
+      contextoFotoTemporariaRef.current = "";
+      setFoto("");
+    }
+  }, [tela, alunoEditando]);
 
   const [alunos, setAlunos] = useState(() => {
     if (supabaseConfigurado) return [];
@@ -722,6 +1242,7 @@ function App() {
       if (usuarioRecuperado.cargo === "aluno") {
         setTela("portalAluno");
       } else if (usuarioRecuperado.cargo === "professor") {
+        setFoto(usuarioRecuperado.foto || usuarioRecuperado.fotoUrl || "");
         setTela("portalProfessor");
       } else {
         setTela("dashboard");
@@ -750,24 +1271,24 @@ function App() {
         }
       }
 
-    const usuarioSalvo =
-      localStorage.getItem(STORAGE_KEYS.usuarioLogado) ||
-      localStorage.getItem("usuario_logado_ariramba");
+      const usuarioSalvo =
+        localStorage.getItem(STORAGE_KEYS.usuarioLogado) ||
+        localStorage.getItem("usuario_logado_ariramba");
 
-    if (usuarioSalvo) {
-      let usuarioRecuperado;
+      if (usuarioSalvo) {
+        let usuarioRecuperado;
 
-      try {
-        usuarioRecuperado = JSON.parse(usuarioSalvo);
-      } catch (error) {
-        console.warn("Sessão salva inválida. Login será solicitado novamente.", error);
-        localStorage.removeItem(STORAGE_KEYS.usuarioLogado);
-        localStorage.removeItem("usuario_logado_ariramba");
-        return;
+        try {
+          usuarioRecuperado = JSON.parse(usuarioSalvo);
+        } catch (error) {
+          console.warn("Sessão salva inválida. Login será solicitado novamente.", error);
+          localStorage.removeItem(STORAGE_KEYS.usuarioLogado);
+          localStorage.removeItem("usuario_logado_ariramba");
+          return;
+        }
+
+        aplicarUsuarioLogado(usuarioRecuperado);
       }
-
-      aplicarUsuarioLogado(usuarioRecuperado);
-    }
     }
 
     restaurarSessaoInicial();
@@ -971,7 +1492,7 @@ function App() {
         { facingMode: "environment" },
         { fps: 15, qrbox: { width: 280, height: 280 }, aspectRatio: 1 },
         processarQrCode,
-        () => {}
+        () => { }
       )
       .then(() => {
         if (scannerAtivo) {
@@ -986,13 +1507,31 @@ function App() {
 
     return () => {
       scannerAtivo = false;
-      scanner
-        .stop()
-        .catch(() => {})
-        .finally(() => {
+      try {
+        const paradaScanner = scanner.stop();
+
+        Promise.resolve(paradaScanner)
+          .catch(() => { })
+          .finally(() => {
+            try {
+              scanner.clear();
+            } catch (error) {
+              console.warn("Scanner ja estava limpo ao sair da tela.", error);
+            }
+
+            document.getElementById("reader")?.replaceChildren();
+          });
+      } catch (error) {
+        console.warn("Scanner ja estava parado ao sair da tela.", error);
+
+        try {
           scanner.clear();
-          document.getElementById("reader")?.replaceChildren();
-        });
+        } catch (erroLimpeza) {
+          console.warn("Scanner ja estava limpo ao sair da tela.", erroLimpeza);
+        }
+
+        document.getElementById("reader")?.replaceChildren();
+      }
     };
   }, [tela, scannerKey]);
 
@@ -1083,6 +1622,7 @@ function App() {
   }, [usuarioLogado?.id, usuarioLogado?.usuario, usuarioOnlineLogado]);
 
   function limparFormulario() {
+    contextoFotoTemporariaRef.current = "";
     setNome("");
     setDataInicio("");
     setUsuarioAluno("");
@@ -1134,6 +1674,7 @@ function App() {
       usuarioInformado || usuarioAtualDoAluno?.usuario || criarUsuarioAluno(nome, usuarios);
     const senhaNormalizada =
       senhaInformada || (!alunoEditando || !usuarioAtualDoAluno ? "1234" : "");
+    const professorEditandoAluno = tipoUsuario === "professor" && alunoEditando;
 
     if (
       usuarioNormalizado !== "" &&
@@ -1147,6 +1688,25 @@ function App() {
       return;
     }
 
+    if (diretorOnlineLogado && usuarioNormalizado) {
+      try {
+        const usuarioOnlineExistente = await buscarUsuarioSistemaOnline(usuarioNormalizado);
+        const usuarioDoMesmoAluno =
+          alunoEditando &&
+          usuarioOnlineExistente?.alunoId &&
+          String(usuarioOnlineExistente.alunoId) === String(alunoEditando.id);
+
+        if (usuarioOnlineExistente && !usuarioDoMesmoAluno) {
+          alert("Este usuário já existe no banco online. Escolha outro usuário para o aluno.");
+          return;
+        }
+      } catch (error) {
+        console.error("Erro ao validar usuário online do aluno.", error);
+        alert(`Não foi possível validar o usuário no banco online.\n\nErro: ${error.message || "erro desconhecido"}`);
+        return;
+      }
+    }
+
     setSalvandoAluno(true);
 
     if (alunoEditando) {
@@ -1155,28 +1715,29 @@ function App() {
         if (aluno.id === alunoEditando.id) {
           alunoAtualizado = {
             ...aluno,
-            nome,
-            telefone,
-            faixa,
-            turma,
-            responsavel,
-            dataNascimento,
-            peso,
-            grau,
-            tipoSanguineo,
-            saude,
-            medicamentos,
-            observacoes,
-            observacaoFinanceira: tipoUsuario === "diretor"
-              ? observacaoFinanceira
-              : aluno.observacaoFinanceira,
-            foto,
-            mensalidade: tipoUsuario === "diretor"
-              ? Number(mensalidade)
-              : Number(aluno.mensalidade || 0),
-            vencimento: tipoUsuario === "diretor"
-              ? Number(vencimento || DIA_COBRANCA_PADRAO)
-              : Number(aluno.vencimento || DIA_COBRANCA_PADRAO),
+            ...(professorEditandoAluno
+              ? {
+                observacoes,
+              }
+              : {
+                nome,
+                telefone,
+                faixa,
+                turma,
+                responsavel,
+                dataNascimento,
+                peso,
+                grau,
+                tipoSanguineo,
+                saude,
+                medicamentos,
+                observacoes,
+                observacaoFinanceira,
+                foto,
+                fotoUrl: foto,
+                mensalidade: Number(mensalidade),
+                vencimento: Number(vencimento || DIA_COBRANCA_PADRAO),
+              }),
             academiaId: aluno.academiaId || usuarioLogado?.academiaId || "",
           };
 
@@ -1257,21 +1818,22 @@ function App() {
               academiaId: usuarioLogado?.academiaId || alunoAtualizado?.academiaId || "",
             })
           );
-      } catch (error) {
-        console.error("Erro ao salvar usuário do aluno online.", error);
-        alert(`Aluno atualizado, mas o acesso online não foi salvo.\n\nErro: ${error.message || "erro desconhecido"}`);
-      }
+        } catch (error) {
+          console.error("Erro ao salvar usuário do aluno online.", error);
+          alert(`Aluno atualizado, mas o acesso online não foi salvo.\n\nErro: ${error.message || "erro desconhecido"}`);
+        }
       }
 
       setAlunoEditando(null);
 
       limparFormulario();
 
-      alert("Aluno atualizado com sucesso.");
-
+      setSalvandoAluno(false);
       setTela("lista");
 
-      setSalvandoAluno(false);
+      setTimeout(() => {
+        alert("Aluno atualizado com sucesso.");
+      }, 0);
       return;
     }
 
@@ -1363,6 +1925,10 @@ function App() {
   }
 
   async function marcarComoPago(idAluno) {
+    if (pagamentoEmAndamentoRef.current) return;
+
+    pagamentoEmAndamentoRef.current = true;
+    setPagamentoEmAndamento(true);
     const dataPagamento = new Date().toLocaleDateString();
     const novosAlunos = alunos.map((aluno) => {
       if (aluno.id === idAluno) {
@@ -1383,18 +1949,45 @@ function App() {
 
     const alunoPago = alunos.find((aluno) => aluno.id === idAluno);
     const alunoAtualizado = novosAlunos.find((aluno) => aluno.id === idAluno);
-    if (!alunoPago || !alunoAtualizado) return;
+    if (!alunoPago || !alunoAtualizado) {
+      pagamentoEmAndamentoRef.current = false;
+      setPagamentoEmAndamento(false);
+      return;
+    }
 
     if (diretorOnlineLogado) {
       try {
+        const pagamentosOnlineAtuais = await listarPagamentosOnline();
+        const pagamentoAguardando = obterPagamentoAguardandoAberto(
+          idAluno,
+          pagamentosOnlineAtuais
+        );
+        const pagamentoPagoNoCiclo = pagamentosOnlineAtuais.find(
+          (pagamento) =>
+            String(pagamento.aluno_id) === String(idAluno) &&
+            pagamento.status === "Pago" &&
+            pagamentoNoCicloAtual(pagamento)
+        );
+
+        if (!pagamentoAguardando && pagamentoPagoNoCiclo) {
+          setAlunos(novosAlunos);
+          await carregarDadosOnlineNoEstado();
+          alert("Este pagamento já está confirmado.");
+          return;
+        }
+
         await Promise.all([
           salvarAlunoOnline(alunoAtualizado),
           salvarPagamentoOnline({
+            ...(pagamentoAguardando?.id ? { id: pagamentoAguardando.id } : {}),
             aluno_id: idAluno,
             valor: calcularValorComJuros(alunoPago),
             status: "Pago",
             data_pagamento: new Date().toISOString().slice(0, 10),
-            comprovante_url: alunoPago.comprovantePagamento || null,
+            comprovante_url:
+              alunoPago.comprovantePagamento ||
+              pagamentoAguardando?.comprovante_url ||
+              null,
           }),
         ]);
         setAlunos(novosAlunos);
@@ -1406,9 +1999,14 @@ function App() {
         });
         alert(`Nao foi possivel confirmar o pagamento no banco online.\n\nErro: ${error.message || "erro desconhecido"}`);
         return;
+      } finally {
+        pagamentoEmAndamentoRef.current = false;
+        setPagamentoEmAndamento(false);
       }
     } else {
       setAlunos(novosAlunos);
+      pagamentoEmAndamentoRef.current = false;
+      setPagamentoEmAndamento(false);
     }
 
     adicionarAviso(`Pagamento confirmado: ${alunoPago.nome}`);
@@ -1459,17 +2057,29 @@ function App() {
     const usuarioNormalizado = usuarioAluno.trim();
 
     if (!alunoPerfil) {
-      alert("Aluno não encontrado.");
+      abrirModalMensagem({
+        tipo: "erro",
+        titulo: "Aluno não encontrado",
+        mensagem: "Aluno não encontrado.",
+      });
       return;
     }
 
     if (!usuarioNormalizado) {
-      alert("Informe um usuario para acessar o portal.");
+      abrirModalMensagem({
+        tipo: "aviso",
+        titulo: "Usuário obrigatório",
+        mensagem: "Informe um usuario para acessar o portal.",
+      });
       return;
     }
 
     if (novaSenha && novaSenha !== confirmarSenha) {
-      alert("As senhas não coincidem.");
+      abrirModalMensagem({
+        tipo: "aviso",
+        titulo: "Senhas diferentes",
+        mensagem: "As senhas não coincidem.",
+      });
       return;
     }
 
@@ -1484,7 +2094,11 @@ function App() {
     });
 
     if (usuarioJaExiste) {
-      alert("Este usuario ja esta em uso. Escolha outro.");
+      abrirModalMensagem({
+        tipo: "aviso",
+        titulo: "Usuário em uso",
+        mensagem: "Este usuario ja esta em uso. Escolha outro.",
+      });
       return;
     }
 
@@ -1512,7 +2126,11 @@ function App() {
 
     if (supabaseConfigurado) {
       if (!idAlunoOnlineValido(alunoPerfil.id)) {
-        alert("Este aluno ainda nao possui um ID online valido. Peça ao mestre para recarregar o aluno pelo Supabase.");
+        abrirModalMensagem({
+          tipo: "erro",
+          titulo: "ID online inválido",
+          mensagem: "Este aluno ainda nao possui um ID online valido. Peça ao mestre para recarregar o aluno pelo Supabase.",
+        });
         return;
       }
 
@@ -1525,7 +2143,11 @@ function App() {
         );
       } catch (error) {
         console.error("Erro ao atualizar cadastro do aluno online.", error);
-        alert(`Nao foi possivel salvar seu cadastro no banco online.\n\nErro: ${error.message || "erro desconhecido"}`);
+        abrirModalMensagem({
+          tipo: "erro",
+          titulo: "Erro ao salvar cadastro",
+          mensagem: `Nao foi possivel salvar seu cadastro no banco online.\n\nErro: ${error.message || "erro desconhecido"}`,
+        });
         return;
       }
     } else {
@@ -1569,6 +2191,16 @@ function App() {
       });
     }
 
+    const concluirAtualizacaoPerfilAluno = () => {
+      setModoEditarPerfil(false);
+
+      abrirModalMensagem({
+        tipo: "sucesso",
+        titulo: "Perfil atualizado",
+        mensagem: "Perfil atualizado com sucesso.",
+      });
+    };
+
     if (usuarioOnlineLogado) {
       const usuarioAtualizado = usuariosAtualizados.find(
         (usuario) =>
@@ -1582,13 +2214,17 @@ function App() {
         }
       } catch (error) {
         console.error("Erro ao atualizar acesso do aluno online.", error);
-        alert(`Cadastro salvo, mas nao foi possivel atualizar o acesso online.\n\nErro: ${error.message || "erro desconhecido"}`);
+        abrirModalMensagem({
+          tipo: "erro",
+          titulo: "Erro ao atualizar acesso",
+          mensagem: `Cadastro salvo, mas nao foi possivel atualizar o acesso online.\n\nErro: ${error.message || "erro desconhecido"}`,
+          aoFechar: concluirAtualizacaoPerfilAluno,
+        });
+        return;
       }
     }
 
-    setModoEditarPerfil(false);
-
-    alert("Perfil atualizado com sucesso.");
+    concluirAtualizacaoPerfilAluno();
   }
 
   async function salvarProfessor() {
@@ -1621,6 +2257,21 @@ function App() {
       return;
     }
 
+    if (diretorOnlineLogado) {
+      try {
+        const usuarioOnlineExistente = await buscarUsuarioSistemaOnline(usuarioProfessor);
+
+        if (usuarioOnlineExistente) {
+          alert("Este usuário já existe no banco online. Escolha outro usuário para o professor.");
+          return;
+        }
+      } catch (error) {
+        console.error("Erro ao validar usuário online do professor.", error);
+        alert(`Não foi possível validar o usuário no banco online.\n\nErro: ${error.message || "erro desconhecido"}`);
+        return;
+      }
+    }
+
     let novoProfessor = criarAcessoProfessor({
       usuario: usuarioProfessor,
       senha: senhaProfessor,
@@ -1638,10 +2289,10 @@ function App() {
       } catch (error) {
         console.error("Erro ao salvar professor online.", error);
         alert(
-          `Professor cadastrado neste navegador, mas não foi possível salvar online.\n\nErro: ${
-            error.message || "erro desconhecido"
+          `Não foi possível cadastrar o professor no banco online.\n\nErro: ${error.message || "erro desconhecido"
           }`
         );
+        return;
       }
     }
 
@@ -1765,8 +2416,7 @@ function App() {
       } catch (error) {
         console.error("Erro ao atualizar acesso do mestre online.", error);
         alert(
-          `Acesso atualizado neste navegador, mas não foi possível salvar online.\n\nErro: ${
-            error.message || "erro desconhecido"
+          `Acesso atualizado neste navegador, mas não foi possível salvar online.\n\nErro: ${error.message || "erro desconhecido"
           }`
         );
         return;
@@ -1783,12 +2433,20 @@ function App() {
     const usuarioNormalizado = usuarioAluno.trim() || usuarioLogado?.usuario || "";
 
     if (!usuarioNormalizado) {
-      alert("Informe o usuário do professor.");
+      abrirModalMensagem({
+        tipo: "aviso",
+        titulo: "Usuário obrigatório",
+        mensagem: "Informe o usuário do professor.",
+      });
       return;
     }
 
     if (novaSenha !== confirmarSenha) {
-      alert("As senhas não coincidem.");
+      abrirModalMensagem({
+        tipo: "aviso",
+        titulo: "Senhas diferentes",
+        mensagem: "As senhas não coincidem.",
+      });
       return;
     }
 
@@ -1805,7 +2463,11 @@ function App() {
     });
 
     if (usuarioJaExiste) {
-      alert("Este usuário já está em uso. Escolha outro.");
+      abrirModalMensagem({
+        tipo: "aviso",
+        titulo: "Usuário em uso",
+        mensagem: "Este usuário já está em uso. Escolha outro.",
+      });
       return;
     }
 
@@ -1820,6 +2482,9 @@ function App() {
       graduacaoProfessor,
       observacoes,
       foto,
+      fotoUrl:
+        usuarioLogado.fotoUrl ||
+        (!fotoProfessorPrecisaUpload(foto) ? foto : ""),
     };
 
     const usuariosAtualizados = usuarios.map((usuario) => {
@@ -1845,12 +2510,46 @@ function App() {
         const usuarioOnline = await salvarUsuarioSistemaOnline(dadosProfessorAtualizados);
 
         if (usuarioOnline?.id) {
+          let fotoUrlProfessor =
+            usuarioOnline.foto_url ||
+            dadosProfessorAtualizados.fotoUrl ||
+            "";
+
+          if (fotoProfessorPrecisaUpload(foto)) {
+            const caminhoFotoProfessor = `professores/${usuarioOnline.id}/foto.jpg`;
+            await enviarArquivoOnline(
+              "fotos-professores",
+              caminhoFotoProfessor,
+              converterDataUrlParaBlob(foto)
+            );
+
+            const { data: fotoPublica } = supabase.storage
+              .from("fotos-professores")
+              .getPublicUrl(caminhoFotoProfessor);
+
+            fotoUrlProfessor = fotoPublica?.publicUrl || "";
+
+            if (!fotoUrlProfessor) {
+              throw new Error("O Storage nao retornou a URL publica da foto do professor.");
+            }
+
+            await salvarUsuarioSistemaOnline({
+              ...dadosProfessorAtualizados,
+              id: usuarioOnline.id,
+              fotoUrl: fotoUrlProfessor,
+              origem: "usuarios_sistema",
+            });
+          }
+
           const professorComIdOnline = {
             ...dadosProfessorAtualizados,
             id: usuarioOnline.id,
+            foto: fotoUrlProfessor || dadosProfessorAtualizados.foto,
+            fotoUrl: fotoUrlProfessor,
             origem: "usuarios_sistema",
           };
 
+          setFoto(professorComIdOnline.foto || professorComIdOnline.fotoUrl || "");
           setUsuarioLogado(professorComIdOnline);
           setUsuarios((usuariosAtuais) =>
             usuariosAtuais.map((usuario) => {
@@ -1872,11 +2571,12 @@ function App() {
         }
       } catch (error) {
         console.error("Erro ao atualizar professor online.", error);
-        alert(
-          `Cadastro atualizado neste navegador, mas não foi possível salvar online.\n\nErro: ${
-            error.message || "erro desconhecido"
-          }`
-        );
+        abrirModalMensagem({
+          tipo: "erro",
+          titulo: "Erro ao salvar online",
+          mensagem: `Cadastro atualizado neste navegador, mas não foi possível salvar online.\n\nErro: ${error.message || "erro desconhecido"
+            }`,
+        });
         return;
       }
     }
@@ -1885,16 +2585,25 @@ function App() {
     setNovaSenha("");
     setConfirmarSenha("");
 
-    alert("Cadastro do professor atualizado.");
+    abrirModalMensagem({
+      tipo: "sucesso",
+      titulo: "Cadastro atualizado",
+      mensagem: "Cadastro do professor atualizado.",
+    });
   }
 
   async function informarPagamento(idAluno, comprovante = null) {
+    if (pagamentoEmAndamentoRef.current) return;
+
+    pagamentoEmAndamentoRef.current = true;
+    setPagamentoEmAndamento(true);
+    const comprovanteParaEnvio = comprovante ?? comprovanteSelecionado;
     const novosAlunos = alunos.map((aluno) => {
       if (aluno.id === idAluno) {
         return {
           ...aluno,
           statusPagamento: "Aguardando",
-          comprovantePagamento: comprovante,
+          comprovantePagamento: comprovanteParaEnvio,
           dataEnvioComprovante: new Date().toLocaleDateString(),
         };
       }
@@ -1902,18 +2611,50 @@ function App() {
     });
 
     const alunoAtualizado = novosAlunos.find((aluno) => aluno.id === idAluno);
-    if (!alunoAtualizado) return;
+    if (!alunoAtualizado) {
+      pagamentoEmAndamentoRef.current = false;
+      setPagamentoEmAndamento(false);
+      return;
+    }
 
     if (usuarioOnlineLogado) {
       try {
+        const pagamentosOnlineAtuais = await listarPagamentosOnline();
+        const pagamentoAguardando = obterPagamentoAguardandoAberto(
+          idAluno,
+          pagamentosOnlineAtuais
+        );
+        const pagamentoPagoNoCiclo = pagamentosOnlineAtuais.find(
+          (pagamento) =>
+            String(pagamento.aluno_id) === String(idAluno) &&
+            pagamento.status === "Pago" &&
+            pagamentoNoCicloAtual(pagamento)
+        );
+
+        if (!pagamentoAguardando && pagamentoPagoNoCiclo) {
+          await carregarDadosOnlineNoEstado();
+          abrirModalMensagem({
+            tipo: "informacao",
+            titulo: "Pagamento já confirmado",
+            mensagem: "Este pagamento já está confirmado neste ciclo.",
+          });
+          return;
+        }
+
         await Promise.all([
           salvarAlunoOnline(alunoAtualizado),
           salvarPagamentoOnline({
+            ...(pagamentoAguardando?.id ? { id: pagamentoAguardando.id } : {}),
             aluno_id: idAluno,
             valor: Number(alunoAtualizado.mensalidade || 0),
             status: "Aguardando",
-            data_pagamento: new Date().toISOString().slice(0, 10),
-            comprovante_url: comprovante,
+            data_pagamento:
+              pagamentoAguardando?.data_pagamento ||
+              new Date().toISOString().slice(0, 10),
+            comprovante_url:
+              comprovanteParaEnvio ||
+              pagamentoAguardando?.comprovante_url ||
+              null,
           }),
         ]);
         setAlunos(novosAlunos);
@@ -1923,15 +2664,29 @@ function App() {
         await carregarDadosOnlineNoEstado().catch((erroSincronizacao) => {
           console.error("Erro ao restaurar dados apos falha no envio de pagamento.", erroSincronizacao);
         });
-        alert(`Nao foi possivel enviar o pagamento ao banco online.\n\nErro: ${error.message || "erro desconhecido"}`);
+        abrirModalMensagem({
+          tipo: "erro",
+          titulo: "Erro ao enviar pagamento",
+          mensagem: `Nao foi possivel enviar o pagamento ao banco online.\n\nErro: ${error.message || "erro desconhecido"}`,
+        });
         return;
+      } finally {
+        pagamentoEmAndamentoRef.current = false;
+        setPagamentoEmAndamento(false);
       }
     } else {
       setAlunos(novosAlunos);
+      pagamentoEmAndamentoRef.current = false;
+      setPagamentoEmAndamento(false);
     }
 
     setNomeComprovanteSelecionado("");
-    alert("Pagamento enviado para analise.");
+    setComprovanteSelecionado(null);
+    abrirModalMensagem({
+      tipo: "sucesso",
+      titulo: "Pagamento enviado",
+      mensagem: "Pagamento enviado para analise.",
+    });
   }
 
   async function rejeitarPagamento(idAluno) {
@@ -2128,53 +2883,259 @@ function App() {
     doc.roundedRect(3, 3, 80, 48, 3, 3, "S");
 
     doc.setTextColor(245, 158, 11);
-    doc.setFontSize(9);
-    doc.text("ARIRAMBA JIU-JITSU SCHOOL", 43, 8.5, { align: "center" });
+    doc.setFontSize(8.5);
+    doc.text("ARIRAMBA JIU-JITSU SCHOOL", 43, 8.2, { align: "center" });
 
     const fotoCarteira = alunoParaPDF.foto || alunoParaPDF.fotoUrl;
 
     if (fotoCarteira) {
       try {
         const fotoCarteirinha = await prepararFotoCarteirinha(fotoCarteira);
-        doc.addImage(fotoCarteirinha, "JPEG", 7, 16, 21, 21);
+        doc.addImage(fotoCarteirinha, "JPEG", 6.5, 15, 21, 21);
       } catch (error) {
         console.error("Erro ao adicionar foto na carteirinha.", error);
         doc.setDrawColor(148, 163, 184);
-        doc.roundedRect(7, 16, 21, 21, 2, 2, "S");
+        doc.roundedRect(6.5, 15, 21, 21, 2, 2, "S");
         doc.setTextColor(148, 163, 184);
         doc.setFontSize(5);
-        doc.text("Foto", 17.5, 27, { align: "center" });
+        doc.text("Foto", 17, 26, { align: "center" });
       }
     } else {
       doc.setDrawColor(148, 163, 184);
-      doc.roundedRect(7, 16, 21, 21, 2, 2, "S");
+      doc.roundedRect(6.5, 15, 21, 21, 2, 2, "S");
       doc.setTextColor(148, 163, 184);
       doc.setFontSize(5);
-      doc.text("Sem foto", 17.5, 27, { align: "center" });
+      doc.text("Sem foto", 17, 26, { align: "center" });
     }
 
     doc.setTextColor(255, 255, 255);
-    doc.setFontSize(6.6);
-    doc.text(`Aluno: ${alunoParaPDF.nome || usuarioLogado?.nome || ""}`, 31, 17, { maxWidth: 31 });
-    doc.text(`Faixa: ${alunoParaPDF.faixa || "Nao informado"}`, 31, 23.5, { maxWidth: 31 });
-    doc.text(`Turma: ${alunoParaPDF.turma || "Adultos"}`, 31, 30, { maxWidth: 31 });
-    doc.text(`Grau: ${alunoParaPDF.grau || "Nao informado"}`, 31, 36.5, { maxWidth: 31 });
-    doc.text(`Status: ${status}`, 31, 43, { maxWidth: 31 });
+    doc.setFontSize(5);
+
+    const larguraTextoCarteirinha = 31;
+    const nomeCarteirinha = doc
+      .splitTextToSize(`Aluno: ${alunoParaPDF.nome || usuarioLogado?.nome || ""}`, larguraTextoCarteirinha)
+      .slice(0, 2);
+    let posicaoTextoCarteirinha = 15.5;
+
+    doc.text(nomeCarteirinha, 30, posicaoTextoCarteirinha);
+    posicaoTextoCarteirinha += nomeCarteirinha.length * 3.2 + 1;
+
+    [
+      "Academia: Ariramba Jiu-Jitsu School",
+      `Faixa: ${alunoParaPDF.faixa || "Nao informado"}`,
+      `Grau: ${alunoParaPDF.grau || "Nao informado"}`,
+      `Turma: ${alunoParaPDF.turma || "Adultos"}`,
+      `Status: ${status}`,
+      `Cobranca: ${formatarDataCobranca(alunoParaPDF)}`,
+    ].forEach((linha) => {
+      const linhasCampo = doc
+        .splitTextToSize(linha, larguraTextoCarteirinha)
+        .slice(0, linha.startsWith("Academia") ? 2 : 1);
+
+      doc.text(linhasCampo, 30, posicaoTextoCarteirinha);
+      posicaoTextoCarteirinha += linhasCampo.length * 3.2 + 1;
+    });
 
     if (qrImagem) {
-      doc.addImage(qrImagem, "PNG", 66, 17, 14, 14);
-      doc.setFontSize(6);
-      doc.text("QR de presenca", 73, 35, { align: "center" });
+      doc.addImage(qrImagem, "PNG", 65, 15, 15, 15);
+      doc.setFontSize(5.4);
+      doc.text("QR de presenca", 72.5, 34, { align: "center", maxWidth: 18 });
     }
 
-    const nomeArquivo = String(alunoParaPDF.nome || "aluno")
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[^a-z0-9]+/gi, "-")
-      .replace(/^-+|-+$/g, "")
-      .toLowerCase();
+    doc.save(`carteirinha-${normalizarNomeArquivo(alunoParaPDF.nome)}.pdf`);
+  }
 
-    doc.save(`carteirinha-${nomeArquivo || "aluno"}.pdf`);
+  async function baixarCarteirinhaPNG(aluno) {
+    if (!aluno) {
+      alert("Aluno nao encontrado.");
+      return;
+    }
+
+    try {
+      const escala = 3;
+      const largura = 650;
+      const altura = 400;
+      const canvas = document.createElement("canvas");
+      const contexto = canvas.getContext("2d");
+      const qrCanvas = document.querySelector(".areaCarteirinha .qrcodeFake canvas");
+      const fotoCarteira = aluno.foto || aluno.fotoUrl;
+      const nomeArquivo = `carteirinha-${normalizarNomeArquivo(aluno.nome)}.png`;
+
+      canvas.width = largura * escala;
+      canvas.height = altura * escala;
+      contexto.scale(escala, escala);
+      contexto.imageSmoothingEnabled = true;
+      contexto.imageSmoothingQuality = "high";
+
+      function retanguloArredondado(x, y, w, h, r) {
+        contexto.beginPath();
+        contexto.moveTo(x + r, y);
+        contexto.lineTo(x + w - r, y);
+        contexto.quadraticCurveTo(x + w, y, x + w, y + r);
+        contexto.lineTo(x + w, y + h - r);
+        contexto.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+        contexto.lineTo(x + r, y + h);
+        contexto.quadraticCurveTo(x, y + h, x, y + h - r);
+        contexto.lineTo(x, y + r);
+        contexto.quadraticCurveTo(x, y, x + r, y);
+        contexto.closePath();
+      }
+
+      function desenharImagemCobrindo(imagem, x, y, w, h) {
+        const escalaImagem = Math.max(w / imagem.width, h / imagem.height);
+        const larguraImagem = imagem.width * escalaImagem;
+        const alturaImagem = imagem.height * escalaImagem;
+        const origemX = x + (w - larguraImagem) / 2;
+        const origemY = y + (h - alturaImagem) / 2;
+
+        contexto.drawImage(imagem, origemX, origemY, larguraImagem, alturaImagem);
+      }
+
+      function textoQuebrado(texto, x, y, larguraMaxima, alturaLinha, maxLinhas = 2) {
+        const palavras = String(texto || "").split(/\s+/).filter(Boolean);
+        const linhas = [];
+        let linhaAtual = "";
+
+        palavras.forEach((palavra) => {
+          const teste = linhaAtual ? `${linhaAtual} ${palavra}` : palavra;
+
+          if (contexto.measureText(teste).width <= larguraMaxima || !linhaAtual) {
+            linhaAtual = teste;
+            return;
+          }
+
+          linhas.push(linhaAtual);
+          linhaAtual = palavra;
+        });
+
+        if (linhaAtual) linhas.push(linhaAtual);
+
+        linhas.slice(0, maxLinhas).forEach((linha, indice) => {
+          contexto.fillText(linha, x, y + indice * alturaLinha);
+        });
+
+        return y + Math.min(linhas.length, maxLinhas) * alturaLinha;
+      }
+
+      retanguloArredondado(0, 0, largura, altura, 26);
+      contexto.save();
+      contexto.clip();
+      const fundo = contexto.createLinearGradient(0, 0, largura, altura);
+      fundo.addColorStop(0, "#f8fafc");
+      fundo.addColorStop(0.22, "#ffffff");
+      fundo.addColorStop(0.23, "#111827");
+      fundo.addColorStop(1, "#05070a");
+      contexto.fillStyle = fundo;
+      contexto.fillRect(0, 0, largura, altura);
+      contexto.restore();
+
+      contexto.strokeStyle = "#f59e0b";
+      contexto.lineWidth = 3;
+      retanguloArredondado(1.5, 1.5, largura - 3, altura - 3, 26);
+      contexto.stroke();
+
+      contexto.fillStyle = "#f8fafc";
+      contexto.font = "900 42px Arial, sans-serif";
+      contexto.fillText("ARIRAMBA", 245, 62);
+      contexto.fillStyle = "#f59e0b";
+      contexto.font = "900 19px Arial, sans-serif";
+      contexto.fillText("JIU-JITSU SCHOOL", 250, 105);
+
+      const imagemLogo = await carregarImagem(logo);
+      retanguloArredondado(78, 28, 100, 100, 12);
+      contexto.fillStyle = "#ffffff";
+      contexto.fill();
+      contexto.drawImage(imagemLogo, 86, 36, 84, 84);
+
+      if (fotoCarteira) {
+        try {
+          const imagemFoto = await carregarImagem(fotoCarteira);
+          retanguloArredondado(38, 145, 180, 180, 18);
+          contexto.save();
+          contexto.clip();
+          desenharImagemCobrindo(imagemFoto, 38, 145, 180, 180);
+          contexto.restore();
+          contexto.strokeStyle = "#f59e0b";
+          contexto.lineWidth = 4;
+          retanguloArredondado(38, 145, 180, 180, 18);
+          contexto.stroke();
+        } catch (error) {
+          console.error("Erro ao adicionar foto na carteirinha PNG.", error);
+        }
+      }
+
+      contexto.fillStyle = "#ffffff";
+      contexto.font = "700 14px Arial, sans-serif";
+      contexto.textAlign = "center";
+      retanguloArredondado(53, 365, 150, 18, 9);
+      contexto.save();
+      contexto.clip();
+      contexto.fillStyle = corDaFaixa(aluno.faixa);
+      contexto.fillRect(53, 365, 105, 18);
+      contexto.fillStyle = String(aluno.faixa || "").toLowerCase() === "preta" ? "#dc2626" : "#111827";
+      contexto.fillRect(158, 365, 45, 18);
+
+      if (aluno.grau) {
+        contexto.fillStyle = "#ffffff";
+        [168, 181, 194].forEach((x) => contexto.fillRect(x, 365, 4, 18));
+      }
+
+      contexto.restore();
+      contexto.strokeStyle = "rgba(255, 255, 255, 0.25)";
+      contexto.lineWidth = 2;
+      retanguloArredondado(53, 365, 150, 18, 9);
+      contexto.stroke();
+
+      contexto.textAlign = "left";
+      contexto.fillStyle = "#ffffff";
+      contexto.font = "900 25px Arial, sans-serif";
+      let yTexto = textoQuebrado(String(aluno.nome || "").toUpperCase(), 245, 155, 280, 29, 2) + 8;
+
+      contexto.font = "400 17px Arial, sans-serif";
+      [
+        `Faixa: ${aluno.faixa || "Nao informada"}`,
+        `Turma: ${aluno.turma || "Adultos"}`,
+        ...(aluno.grau ? [`Grau: ${aluno.grau}`] : []),
+        `Nascimento: ${formatarData(aluno.dataNascimento)}`,
+        `Carteira emitida: ${new Date().getFullYear()}`,
+        "Renovação: Próxima troca de faixa",
+        `ID: ${aluno.id}`,
+      ].forEach((linha) => {
+        yTexto = textoQuebrado(linha, 245, yTexto, 300, 22, 2) + 2;
+      });
+
+      retanguloArredondado(515, 260, 105, 105, 12);
+      contexto.fillStyle = "#ffffff";
+      contexto.fill();
+
+      if (qrCanvas) {
+        contexto.drawImage(qrCanvas, 528, 273, 80, 80);
+      }
+
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          const linkFallback = document.createElement("a");
+          linkFallback.href = canvas.toDataURL("image/png");
+          linkFallback.download = nomeArquivo;
+          linkFallback.rel = "noopener";
+          linkFallback.click();
+          return;
+        }
+
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = nomeArquivo;
+        link.rel = "noopener";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }, "image/png");
+    } catch (error) {
+      console.error("Erro ao baixar carteirinha em PNG.", error);
+      alert("Nao foi possivel gerar a imagem da carteirinha.");
+    }
   }
 
   async function abrirCarteirinha(aluno) {
@@ -2262,7 +3223,7 @@ function App() {
         return aluno;
       });
 
-      if (diretorOnlineLogado) {
+      if (usuarioOnlineLogado) {
         try {
           await registrarPresencaOnline(novaPresenca);
         } catch (error) {
@@ -2423,15 +3384,20 @@ function App() {
       setTela("portalAluno");
 
       if (usuarioEncontrado.senha === "1234") {
+        setNovaSenha("");
+        setConfirmarSenha("");
         setModoEditarPerfil(true);
-        alert("Primeiro acesso detectado. Troque sua senha para continuar 🔐");
+        avisarPrimeiroAcesso();
       }
     } else if (usuarioEncontrado.cargo === "professor") {
+      setFoto(usuarioEncontrado.foto || usuarioEncontrado.fotoUrl || "");
       setTela("portalProfessor");
 
       if (usuarioEncontrado.senha === "1234") {
+        setNovaSenha("");
+        setConfirmarSenha("");
         setModoEditarPerfil(true);
-        alert("Primeiro acesso detectado. Troque sua senha para continuar 🔐");
+        avisarPrimeiroAcesso();
       }
     } else {
       setTela("dashboard");
@@ -2459,6 +3425,10 @@ function App() {
           return jaExiste ? usuariosAtuais : [...usuariosAtuais, usuarioOnlineSistema];
         });
 
+        if (usuarioOnlineSistema.cargo === "professor") {
+          setFoto(usuarioOnlineSistema.foto || usuarioOnlineSistema.fotoUrl || "");
+        }
+
         setUsuarioLogado(usuarioOnlineSistema);
         setTipoUsuario(usuarioOnlineSistema.cargo);
         setErroArmazenamento("");
@@ -2478,7 +3448,11 @@ function App() {
     const senhaDigitada = senha.trim();
 
     if (!usuarioDigitado || !senhaDigitada) {
-      alert("Digite usuário e senha.");
+      abrirModalMensagem({
+        tipo: "aviso",
+        titulo: "Campos obrigatórios",
+        mensagem: "Digite usuário e senha.",
+      });
       return;
     }
 
@@ -2486,8 +3460,8 @@ function App() {
 
     const usuarioLocal = usuarios.find(
       (u) =>
-        u.usuario.trim().toLowerCase() === usuarioDigitado.toLowerCase() &&
-        u.senha.trim() === senhaDigitada
+        String(u?.usuario || "").trim().toLowerCase() === usuarioDigitado.toLowerCase() &&
+        String(u?.senha || "").trim() === senhaDigitada
     );
 
     if (usuarioLocal) {
@@ -2543,7 +3517,11 @@ function App() {
           await sairDoSupabase().catch((error) => {
             console.error("Erro ao encerrar sessao sem perfil online.", error);
           });
-          alert("Login autenticado, mas este usuario ainda nao possui perfil autorizado no banco online.");
+          abrirModalMensagem({
+            tipo: "erro",
+            titulo: "Perfil não autorizado",
+            mensagem: "Login autenticado, mas este usuário ainda não possui perfil autorizado no banco online.",
+          });
           setLoginEmAndamento(false);
           return;
         }
@@ -2581,27 +3559,47 @@ function App() {
         return;
       } catch (error) {
         console.error("Erro no login online.", error);
-        await sairDoSupabase().catch(() => {});
-        alert(
-          `Não foi possível entrar pelo Supabase.\n\nDetalhe: ${
-            error.message || "erro desconhecido"
-          }`
-        );
+        limitarTempo(
+          sairDoSupabase(),
+          3000,
+          "Logout apos falha no login demorou demais."
+        ).catch((erroLogout) => {
+          console.error("Erro ao limpar sessao apos falha no login.", erroLogout);
+        });
+        abrirModalMensagem({
+          tipo: "erro",
+          titulo: "Erro no login",
+          mensagem: `Não foi possível entrar pelo Supabase.\n\nDetalhe: ${error.message || "erro desconhecido"
+            }`,
+        });
         setLoginEmAndamento(false);
         return;
       }
     }
-    alert("Usuário ou senha inválidos!");
+    abrirModalMensagem({
+      tipo: "erro",
+      titulo: "Login inválido",
+      mensagem: "Usuário ou senha inválidos.",
+    });
     setLoginEmAndamento(false);
   }
 
-  function sairDoSistema() {
+  async function sairDoSistema() {
+    if (supabaseConfigurado) {
+      await sairDoSupabase().catch((error) => {
+        console.error("Erro ao sair do Supabase.", error);
+      });
+    }
+
     setTela("inicio");
     setUsuario("");
     setSenha("");
     setTipoUsuario("");
     setUsuarioLogado(null);
     setModoEditarPerfil(false);
+    setNovaSenha("");
+    setConfirmarSenha("");
+    setFoto("");
     setMenuAberto(false);
     localStorage.removeItem(STORAGE_KEYS.usuarioLogado);
     localStorage.removeItem("usuario_logado_ariramba");
@@ -2700,11 +3698,77 @@ function App() {
     setMedicamentos(aluno.medicamentos);
     setObservacoes(aluno.observacoes);
     setObservacaoFinanceira(aluno.observacaoFinanceira || "");
+    contextoFotoTemporariaRef.current = "";
     setFoto(aluno.foto);
     setMensalidade(aluno.mensalidade);
     setVencimento(aluno.vencimento);
 
     setTela("cadastro");
+  }
+
+  async function resetarSenhaAluno(aluno) {
+    if (tipoUsuario !== "diretor") return;
+
+    const usuarioLocal = usuarios.find(
+      (usuario) => String(usuario.alunoId) === String(aluno.id)
+    );
+    let usuarioParaAtualizar = usuarioLocal;
+
+    if (diretorOnlineLogado) {
+      try {
+        usuarioParaAtualizar =
+          usuarioParaAtualizar ||
+          (await buscarUsuarioSistemaOnlinePorAluno(aluno.id));
+
+        if (!usuarioParaAtualizar) {
+          alert("Não foi encontrado acesso online para este aluno.");
+          return;
+        }
+
+        await salvarUsuarioSistemaOnline({
+          ...usuarioParaAtualizar,
+          senha: "1234",
+          academiaId:
+            usuarioParaAtualizar.academiaId ||
+            aluno.academiaId ||
+            usuarioLogado?.academiaId ||
+            "",
+        });
+      } catch (error) {
+        console.error("Erro ao resetar senha online do aluno.", error);
+        alert(`Não foi possível resetar a senha no banco online.\n\nErro: ${error.message || "erro desconhecido"}`);
+        return;
+      }
+    }
+
+    if (!usuarioParaAtualizar) {
+      alert("Não foi encontrado acesso para este aluno.");
+      return;
+    }
+
+    setUsuarios((usuariosAtuais) => {
+      const jaExiste = usuariosAtuais.some(
+        (usuario) => String(usuario.alunoId) === String(aluno.id)
+      );
+
+      if (!jaExiste) {
+        return [
+          ...usuariosAtuais,
+          {
+            ...usuarioParaAtualizar,
+            senha: "1234",
+          },
+        ];
+      }
+
+      return usuariosAtuais.map((usuario) =>
+        String(usuario.alunoId) === String(aluno.id)
+          ? { ...usuario, senha: "1234" }
+          : usuario
+      );
+    });
+
+    alert("Senha resetada para 1234.");
   }
 
   const alunosFiltrados = alunos.filter((aluno) => {
@@ -2737,6 +3801,26 @@ function App() {
   });
 
   useEffect(() => {
+    if (tela !== "portalProfessor" || usuarioLogado?.cargo !== "professor") {
+      return;
+    }
+
+    setFoto((fotoAtual) => {
+      const contextoProfessorAtual = `portal-professor:${usuarioLogado?.id || usuarioLogado?.usuario || ""}`;
+      const fotoTemporariaDoContextoAtual =
+        String(fotoAtual || "").startsWith("data:image/") &&
+        contextoFotoTemporariaRef.current === contextoProfessorAtual;
+
+      if (modoEditarPerfil && fotoTemporariaDoContextoAtual) {
+        return fotoAtual;
+      }
+
+      contextoFotoTemporariaRef.current = "";
+      return usuarioLogado?.foto || usuarioLogado?.fotoUrl || "";
+    });
+  }, [tela, usuarioLogado, modoEditarPerfil]);
+
+  useEffect(() => {
     if (tela === "portalAluno" && alunoDoPortal) {
       const usuarioDoAluno = usuarios.find(
         (usuario) =>
@@ -2751,9 +3835,21 @@ function App() {
       setSaude(alunoDoPortal.saude || "");
       setMedicamentos(alunoDoPortal.medicamentos || "");
       setObservacoes(alunoDoPortal.observacoes || "");
-      setFoto(alunoDoPortal.foto || "");
+      setFoto((fotoAtual) => {
+        const contextoAlunoAtual = `portal-aluno:${alunoDoPortal?.id || usuarioLogado?.alunoId || usuarioLogado?.usuario || ""}`;
+        const fotoTemporariaDoContextoAtual =
+          String(fotoAtual || "").startsWith("data:image/") &&
+          contextoFotoTemporariaRef.current === contextoAlunoAtual;
+
+        if (modoEditarPerfil && fotoTemporariaDoContextoAtual) {
+          return fotoAtual;
+        }
+
+        contextoFotoTemporariaRef.current = "";
+        return alunoDoPortal.foto || alunoDoPortal.fotoUrl || "";
+      });
     }
-  }, [tela, alunoDoPortal, usuarios, usuarioLogado]);
+  }, [tela, alunoDoPortal, usuarios, usuarioLogado, modoEditarPerfil]);
 
   useEffect(() => {
     if (
@@ -2780,10 +3876,10 @@ function App() {
 
           return jaExiste
             ? alunosAtuais.map((alunoAtual) =>
-                String(alunoAtual.id) === String(alunoNormalizado.id)
-                  ? alunoNormalizado
-                  : alunoAtual
-              )
+              String(alunoAtual.id) === String(alunoNormalizado.id)
+                ? alunoNormalizado
+                : alunoAtual
+            )
             : [...alunosAtuais, alunoNormalizado];
         });
       })
@@ -2926,6 +4022,141 @@ function App() {
   }
 
   const resumoTurmas = ["Kids", "Adultos"].map(obterResumoPorTurma);
+  const resumoFinanceiroDashboard = [
+    {
+      rotulo: "Pagas",
+      valor: totalPagos,
+      classe: "pago",
+    },
+    {
+      rotulo: "Pendentes",
+      valor: totalPendentes,
+      classe: "pendente",
+    },
+    {
+      rotulo: "Vencidas",
+      valor: totalVencidos,
+      classe: "vencido",
+    },
+    {
+      rotulo: "Aguardando",
+      valor: pagamentosAguardando.length,
+      classe: "aguardando",
+    },
+  ];
+  const maxResumoFinanceiro = Math.max(
+    ...resumoFinanceiroDashboard.map((item) => item.valor),
+    1
+  );
+  const presencaTurmasDashboard = resumoTurmas.map((resumo) => ({
+    rotulo: resumo.turma,
+    valor: resumo.presencasHoje,
+    alunos: resumo.alunos,
+  }));
+  const maxPresencasTurmaDashboard = Math.max(
+    ...presencaTurmasDashboard.map((item) => item.valor),
+    1
+  );
+  const arrecadacaoPorMes = new Map();
+
+  pagamentos
+    .filter((pagamento) => pagamento.status === "Pago")
+    .forEach((pagamento) => {
+      const dataPagamento = dataBrasilParaDate(
+        pagamento.data_pagamento || pagamento.criado_em
+      );
+
+      if (!dataPagamento) return;
+
+      const chave = `${dataPagamento.getFullYear()}-${String(dataPagamento.getMonth() + 1).padStart(2, "0")}`;
+      const registroAtual = arrecadacaoPorMes.get(chave) || {
+        chave,
+        rotulo: dataPagamento.toLocaleDateString("pt-BR", {
+          month: "short",
+          year: "2-digit",
+        }),
+        valor: 0,
+      };
+
+      arrecadacaoPorMes.set(chave, {
+        ...registroAtual,
+        valor: registroAtual.valor + Number(pagamento.valor || 0),
+      });
+    });
+
+  const arrecadacaoMensalDashboard = [...arrecadacaoPorMes.values()]
+    .sort((a, b) => a.chave.localeCompare(b.chave))
+    .slice(-6);
+  const maxArrecadacaoMensalDashboard = Math.max(
+    ...arrecadacaoMensalDashboard.map((item) => item.valor),
+    1
+  );
+  const alunosPorIdDashboard = new Map(
+    alunos.map((aluno) => [String(aluno.id), aluno])
+  );
+  const pagamentosConsolidadosDashboard = [
+    ...pagamentos.reduce((mapa, pagamento) => {
+      const dataPagamento = dataBrasilParaDate(
+        pagamento.data_pagamento || pagamento.criado_em
+      );
+      const chaveCiclo = dataPagamento
+        ? `${pagamento.aluno_id}-${dataPagamento.getFullYear()}-${dataPagamento.getMonth()}`
+        : `${pagamento.aluno_id}-${pagamento.id}`;
+      const pagamentoAtual = mapa.get(chaveCiclo);
+      const prioridadeStatus = {
+        Pago: 4,
+        Rejeitado: 3,
+        Aguardando: 2,
+        Pendente: 1,
+      };
+      const prioridadePagamento = prioridadeStatus[pagamento.status] || 0;
+      const prioridadeAtual = prioridadeStatus[pagamentoAtual?.status] || 0;
+      const pagamentoMaisRecente =
+        dataPagamentoParaTempo(pagamento) > dataPagamentoParaTempo(pagamentoAtual || {});
+
+      if (
+        !pagamentoAtual ||
+        prioridadePagamento > prioridadeAtual ||
+        (prioridadePagamento === prioridadeAtual && pagamentoMaisRecente)
+      ) {
+        mapa.set(chaveCiclo, pagamento);
+      }
+
+      return mapa;
+    }, new Map()).values(),
+  ];
+  const atividadesRecentesDashboard = [
+    ...pagamentosConsolidadosDashboard.map((pagamento) => {
+      const aluno = alunosPorIdDashboard.get(String(pagamento.aluno_id));
+      const data = pagamento.data_pagamento || pagamento.criado_em || "";
+
+      return {
+        id: `pagamento-${pagamento.id || pagamento.aluno_id}-${data}`,
+        tipo: "Pagamento",
+        titulo: `${pagamento.status || "Pagamento"} - ${aluno?.nome || "Aluno"}`,
+        detalhe: `${formatarMoeda(pagamento.valor)}${data ? ` em ${dataISOParaBrasil(data.split("T")[0])}` : ""}`,
+        tempo: dataPagamentoParaTempo(pagamento),
+      };
+    }),
+    ...presencas.map((presenca, indice) => ({
+      id: `presenca-${presenca.alunoId || presenca.nome}-${presenca.data}-${presenca.hora || indice}`,
+      tipo: "Presença",
+      titulo: presenca.nome || alunosPorIdDashboard.get(String(presenca.alunoId))?.nome || "Aluno",
+      detalhe: `${presenca.data || "Data não informada"}${presenca.hora ? ` às ${presenca.hora}` : ""}`,
+      tempo: dataBrasilParaDate(presenca.data)?.getTime() || 0,
+    })),
+    ...avisosDoPainel
+      .filter((aviso) => !String(aviso.mensagem || "").startsWith("Pagamento "))
+      .map((aviso) => ({
+        id: `aviso-${aviso.id}`,
+        tipo: "Aviso",
+        titulo: aviso.mensagem,
+        detalhe: aviso.data,
+        tempo: 0,
+      })),
+  ]
+    .sort((a, b) => b.tempo - a.tempo)
+    .slice(0, 6);
   const alunosAtencaoRelatorio = alunos.filter(
     (aluno) =>
       verificarVencimento(aluno) === "Vencido" ||
@@ -2971,6 +4202,29 @@ function App() {
       ultimoPagamento.getMonth() === agora.getMonth() &&
       ultimoPagamento.getFullYear() === agora.getFullYear()
     );
+  }
+
+  function pagamentoNoCicloAtual(pagamento) {
+    const dataPagamento = dataBrasilParaDate(
+      pagamento?.data_pagamento || pagamento?.criado_em
+    );
+    const agora = new Date();
+
+    return Boolean(
+      dataPagamento &&
+      dataPagamento.getMonth() === agora.getMonth() &&
+      dataPagamento.getFullYear() === agora.getFullYear()
+    );
+  }
+
+  function obterPagamentoAguardandoAberto(idAluno, listaPagamentos = pagamentos) {
+    return listaPagamentos
+      .filter((pagamento) =>
+        String(pagamento.aluno_id) === String(idAluno) &&
+        pagamento.status === "Aguardando" &&
+        pagamentoNoCicloAtual(pagamento)
+      )
+      .sort((a, b) => dataPagamentoParaTempo(b) - dataPagamentoParaTempo(a))[0];
   }
 
   function obterDataVencimentoAtual(aluno) {
@@ -3199,6 +4453,7 @@ function App() {
             ENTRAR NO SISTEMA
           </button>
         </div>
+
       </div>
     );
   }
@@ -3230,6 +4485,11 @@ function App() {
             {loginEmAndamento ? "Entrando..." : "Entrar no Sistema"}
           </button>
         </div>
+
+        <ModalMensagem
+          modal={modalMensagem}
+          onFechar={fecharModalMensagem}
+        />
       </div>
     );
   }
@@ -3253,21 +4513,27 @@ function App() {
 
             <input
               type="text"
+              name="novoProfessorNome"
               placeholder="Nome do professor"
+              autoComplete="off"
               value={nome}
               onChange={(e) => setNome(e.target.value)}
             />
 
             <input
               type="text"
+              name="novoProfessorUsuario"
               placeholder="Usuário"
+              autoComplete="off"
               value={usuarioAluno}
               onChange={(e) => setUsuarioAluno(e.target.value)}
             />
 
             <input
               type="password"
+              name="novaSenhaProfessor"
               placeholder="Senha"
+              autoComplete="new-password"
               value={senhaAluno}
               onChange={(e) => setSenhaAluno(e.target.value)}
             />
@@ -3296,6 +4562,12 @@ function App() {
       return null;
     }
 
+    const fotoCadastroAluno = alunoEditando
+      ? foto
+      : fotoTemporariaPertenceAoContextoAtual()
+        ? foto
+        : "";
+
     return (
       <div className="layoutSistema">
         {menuAberto && (
@@ -3316,6 +4588,7 @@ function App() {
               type="text"
               placeholder="Nome do aluno"
               value={nome}
+              disabled={tipoUsuario !== "diretor"}
               onChange={(e) => setNome(e.target.value)}
             />
 
@@ -3323,6 +4596,7 @@ function App() {
               type="text"
               placeholder="Peso"
               value={peso}
+              disabled={tipoUsuario !== "diretor"}
               onChange={(e) => setPeso(e.target.value)}
             />
 
@@ -3331,6 +4605,7 @@ function App() {
               inputMode="numeric"
               placeholder="Nascimento (dd/mm/aaaa)"
               value={dataNascimento}
+              disabled={tipoUsuario !== "diretor"}
               onChange={(e) => setDataNascimento(formatarCampoData(e.target.value))}
             />
 
@@ -3338,10 +4613,23 @@ function App() {
               type="text"
               placeholder="Faixa"
               value={faixa}
+              disabled={tipoUsuario !== "diretor"}
               onChange={(e) => setFaixa(e.target.value)}
             />
 
-            <select value={turma} onChange={(e) => setTurma(e.target.value)}>
+            <input
+              type="text"
+              placeholder="Grau"
+              value={grau}
+              disabled={tipoUsuario !== "diretor"}
+              onChange={(e) => setGrau(e.target.value)}
+            />
+
+            <select
+              value={turma}
+              disabled={tipoUsuario !== "diretor"}
+              onChange={(e) => setTurma(e.target.value)}
+            >
               <option value="Adultos">Turma Adultos</option>
               <option value="Kids">Turma Kids</option>
             </select>
@@ -3351,6 +4639,7 @@ function App() {
               inputMode="numeric"
               placeholder="Inicio (dd/mm/aaaa)"
               value={dataInicio}
+              disabled={tipoUsuario !== "diretor"}
               onChange={(e) => setDataInicio(formatarCampoData(e.target.value))}
             />
 
@@ -3378,6 +4667,7 @@ function App() {
               type="text"
               placeholder="Telefone"
               value={telefone}
+              disabled={tipoUsuario !== "diretor"}
               onChange={(e) => setTelefone(e.target.value)}
             />
 
@@ -3385,32 +4675,29 @@ function App() {
               type="text"
               placeholder="Responsável"
               value={responsavel}
+              disabled={tipoUsuario !== "diretor"}
               onChange={(e) => setResponsavel(e.target.value)}
-            />
-
-            <input
-              type="text"
-              placeholder="Grau"
-              value={grau}
-              onChange={(e) => setGrau(e.target.value)}
             />
 
             <input
               type="text"
               placeholder="Tipo sanguíneo"
               value={tipoSanguineo}
+              disabled={tipoUsuario !== "diretor"}
               onChange={(e) => setTipoSanguineo(e.target.value)}
             />
 
             <textarea
               placeholder="Problemas de saúde"
               value={saude}
+              disabled={tipoUsuario !== "diretor"}
               onChange={(e) => setSaude(e.target.value)}
             />
 
             <textarea
               placeholder="Medicamentos"
               value={medicamentos}
+              disabled={tipoUsuario !== "diretor"}
               onChange={(e) => setMedicamentos(e.target.value)}
             />
 
@@ -3438,28 +4725,78 @@ function App() {
               </>
             )}
 
-            <input
-              type="file"
-              accept="image/*"
-              capture="environment"
-              onChange={async (e) => {
-                const arquivo = e.target.files[0];
+            {tipoUsuario === "diretor" && (
+              <div className="opcoesFotoAluno">
+                <label htmlFor="fotoAlunoCamera">
+                  Tirar foto
+                </label>
 
-                if (arquivo) {
-                  try {
-                    setFoto(await lerImagemCompactada(arquivo));
-                  } catch (error) {
-                    alert(error.message || "Nao foi possivel carregar a foto.");
-                  }
-                }
-              }}
-            />
+                <input
+                  id="fotoAlunoCamera"
+                  className="inputFotoAluno"
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  onChange={async (e) => {
+                    const arquivo = e.target.files[0];
+                    e.target.value = "";
 
-            {foto && (
-              <img
-                src={foto}
-                alt="Preview"
-                className="previewFoto"
+                    if (arquivo) {
+                      await prepararFotoParaAjuste(arquivo);
+                    }
+                  }}
+                />
+
+                <label htmlFor="fotoAlunoGaleria">
+                  Escolher da galeria
+                </label>
+
+                <input
+                  id="fotoAlunoGaleria"
+                  className="inputFotoAluno"
+                  type="file"
+                  accept="image/*"
+                  onChange={async (e) => {
+                    const arquivo = e.target.files[0];
+                    e.target.value = "";
+
+                    if (arquivo) {
+                      await prepararFotoParaAjuste(arquivo);
+                    }
+                  }}
+                />
+              </div>
+            )}
+
+            {fotoCadastroAluno && (
+              <>
+                <img
+                  src={fotoCadastroAluno}
+                  alt="Preview"
+                  className="previewFoto"
+                />
+
+                <button
+                  type="button"
+                  onClick={() => abrirAjusteFoto(fotoCadastroAluno)}
+                >
+                  Ajustar foto
+                </button>
+              </>
+            )}
+
+            {ajusteFotoAberto && (
+              <AjustadorFoto
+                foto={fotoParaAjustar}
+                zoom={zoomFoto}
+                posicaoX={posicaoFotoX}
+                posicaoY={posicaoFotoY}
+                onZoom={setZoomFoto}
+                onPosicaoX={setPosicaoFotoX}
+                onPosicaoY={setPosicaoFotoY}
+                onTamanhoPreview={setTamanhoPreviewFoto}
+                onCancelar={cancelarAjusteFoto}
+                onConfirmar={confirmarAjusteFoto}
               />
             )}
 
@@ -3586,33 +4923,20 @@ function App() {
 
                   {tipoUsuario === "diretor" && (
                     <button
-                      onClick={() => {
-                        const usuariosAtualizados = usuarios.map((usuario) => {
-                          if (usuario.alunoId === aluno.id) {
-                            return {
-                              ...usuario,
-                              senha: "1234",
-                            };
-                          }
-
-                          return usuario;
-                        });
-
-                        setUsuarios(usuariosAtualizados);
-
-                        alert("Senha resetada para 1234 🔐");
-                      }}
+                      onClick={() => resetarSenhaAluno(aluno)}
                     >
                       Resetar Senha
                     </button>
                   )}
 
-                  <Botao
-                    tipo="danger"
-                    onClick={() => removerAluno(aluno.id)}
-                  >
-                    Remover Aluno
-                  </Botao>
+                  {tipoUsuario === "diretor" && (
+                    <Botao
+                      tipo="danger"
+                      onClick={() => removerAluno(aluno.id)}
+                    >
+                      Remover Aluno
+                    </Botao>
+                  )}
 
                   <Botao
                     tipo="success"
@@ -3637,8 +4961,6 @@ function App() {
                         className="fotoCarteirinha"
                       />
                     )}
-
-                    <p style={{ color: "white" }}>TESTE QR</p>
 
                     <div className="faixaMini">
                       <div
@@ -3714,6 +5036,10 @@ function App() {
                   </div>
                 </div>
 
+                <button onClick={() => baixarCarteirinhaPNG(alunoCarteirinha)}>
+                  Baixar Carteirinha
+                </button>
+
                 <button onClick={() => setAlunoCarteirinha(null)}>Fechar</button>
               </div>
             )}
@@ -3721,7 +5047,7 @@ function App() {
           <button
             className="botaoVoltar"
             onClick={() => {
-              setTela("dashboard");
+              setTela(tipoUsuario === "professor" ? "portalProfessor" : "dashboard");
               setMenuAberto(false);
             }}
           >
@@ -3865,7 +5191,10 @@ function App() {
                               Abrir WhatsApp
                             </button>
                             {verificarVencimento(aluno) !== "Pago" && (
-                              <button onClick={() => marcarComoPago(aluno.id)}>
+                              <button
+                                disabled={pagamentoEmAndamento}
+                                onClick={() => marcarComoPago(aluno.id)}
+                              >
                                 Confirmar pagamento
                               </button>
                             )}
@@ -4053,8 +5382,11 @@ function App() {
                 </p>
 
                 {aluno.statusPagamento === "Pendente" ? (
-                  <button onClick={() => marcarComoPago(aluno.id)}>
-                    Confirmar Pagamento
+                  <button
+                    disabled={pagamentoEmAndamento}
+                    onClick={() => marcarComoPago(aluno.id)}
+                  >
+                    {pagamentoEmAndamento ? "Confirmando..." : "Confirmar Pagamento"}
                   </button>
                 ) : (
                   <button onClick={() => marcarComoPendente(aluno.id)}>
@@ -4283,6 +5615,10 @@ function App() {
   }
 
   if (tela === "portalProfessor") {
+    const fotoProfessor = fotoTemporariaPertenceAoContextoAtual()
+      ? foto
+      : usuarioLogado?.fotoUrl || usuarioLogado?.foto || "";
+
     return (
       <div className="layoutSistema">
 
@@ -4313,9 +5649,9 @@ function App() {
 
             <h2>{usuarioLogado?.nome}</h2>
 
-            {foto && (
+            {fotoProfessor && (
               <img
-                src={foto}
+                src={fotoProfessor}
                 alt="Professor"
                 className="fotoAlunoLista"
               />
@@ -4334,6 +5670,16 @@ function App() {
               />
 
               <CardEstatistica
+                titulo="Turma Kids"
+                valor={totalKids}
+              />
+
+              <CardEstatistica
+                titulo="Turma Adultos"
+                valor={totalAdultos}
+              />
+
+              <CardEstatistica
                 titulo="Presenças Hoje"
                 valor={presencasHoje}
               />
@@ -4349,10 +5695,11 @@ function App() {
 
             <button
               onClick={() => {
+                setNovaSenha("");
+                setConfirmarSenha("");
+
                 if (!modoEditarPerfil) {
                   setUsuarioAluno(usuarioLogado?.usuario || "");
-                  setNovaSenha("");
-                  setConfirmarSenha("");
                 }
 
                 setModoEditarPerfil(!modoEditarPerfil);
@@ -4406,14 +5753,18 @@ function App() {
 
                 <input
                   type="password"
+                  name="novaSenhaPerfilProfessor"
                   placeholder="Nova senha"
+                  autoComplete="new-password"
                   value={novaSenha}
                   onChange={(e) => setNovaSenha(e.target.value)}
                 />
 
                 <input
                   type="password"
+                  name="confirmarNovaSenhaPerfilProfessor"
                   placeholder="Confirmar nova senha"
+                  autoComplete="new-password"
                   value={confirmarSenha}
                   onChange={(e) => setConfirmarSenha(e.target.value)}
                 />
@@ -4424,29 +5775,62 @@ function App() {
                   onChange={(e) => setObservacoes(e.target.value)}
                 />
 
-                <input
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  onChange={async (e) => {
-                    const arquivo = e.target.files[0];
+                <div className="opcoesFotoAluno">
+                  <label htmlFor="fotoProfessorCamera">
+                    Tirar foto
+                  </label>
 
-                    if (arquivo) {
-                      try {
-                        setFoto(await lerImagemCompactada(arquivo));
-                      } catch (error) {
-                        alert(error.message || "Nao foi possivel carregar a foto.");
+                  <input
+                    id="fotoProfessorCamera"
+                    className="inputFotoAluno"
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    onChange={async (e) => {
+                      const arquivo = e.target.files[0];
+                      e.target.value = "";
+
+                      if (arquivo) {
+                        await prepararFotoParaAjuste(arquivo);
                       }
-                    }
-                  }}
-                />
-
-                {foto && (
-                  <img
-                    src={foto}
-                    alt="Professor"
-                    className="previewFoto"
+                    }}
                   />
+
+                  <label htmlFor="fotoProfessorGaleria">
+                    Escolher da galeria
+                  </label>
+
+                  <input
+                    id="fotoProfessorGaleria"
+                    className="inputFotoAluno"
+                    type="file"
+                    accept="image/*"
+                    onChange={async (e) => {
+                      const arquivo = e.target.files[0];
+                      e.target.value = "";
+
+                      if (arquivo) {
+                        await prepararFotoParaAjuste(arquivo);
+                      }
+                    }}
+                  />
+                </div>
+
+                {fotoProfessor && (
+                  <>
+                    <img
+                      src={fotoProfessor}
+                      alt="Professor"
+                      className="previewFoto"
+                    />
+
+                    <button
+                      type="button"
+                      onClick={() => abrirAjusteFoto(fotoProfessor)}
+                    >
+                      Ajustar foto
+                    </button>
+                  </>
                 )}
 
 
@@ -4461,11 +5845,43 @@ function App() {
 
         </main>
 
+        <ModalMensagem
+          modal={modalMensagem}
+          onFechar={fecharModalMensagem}
+        />
+
+        {ajusteFotoAberto && (
+          <AjustadorFoto
+            foto={fotoParaAjustar}
+            zoom={zoomFoto}
+            posicaoX={posicaoFotoX}
+            posicaoY={posicaoFotoY}
+            onZoom={setZoomFoto}
+            onPosicaoX={setPosicaoFotoX}
+            onPosicaoY={setPosicaoFotoY}
+            onTamanhoPreview={setTamanhoPreviewFoto}
+            onCancelar={cancelarAjusteFoto}
+            onConfirmar={confirmarAjusteFoto}
+          />
+        )}
+
       </div>
     );
   }
 
   if (tela === "portalAluno") {
+    const fotoTemporariaAlunoPortal = fotoTemporariaPertenceAoContextoAtual()
+      ? foto
+      : "";
+    const fotoAlunoPortal =
+      fotoTemporariaAlunoPortal ||
+      alunoDoPortal?.foto ||
+      alunoDoPortal?.fotoUrl ||
+      "";
+    const inicialAlunoPortal = String(alunoDoPortal?.nome || usuarioLogado?.nome || "A")
+      .trim()
+      .charAt(0)
+      .toUpperCase();
 
     return (
       <div className="layoutSistema">
@@ -4496,6 +5912,30 @@ function App() {
           <div className="cardAluno">
 
             <h2>{usuarioLogado?.nome}</h2>
+
+            {fotoAlunoPortal ? (
+              <img
+                src={fotoAlunoPortal}
+                alt="Foto do aluno"
+                className="fotoAlunoLista"
+              />
+            ) : (
+              <div
+                className="fotoAlunoLista"
+                aria-label="Aluno sem foto cadastrada"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "#111827",
+                  color: "#f59e0b",
+                  fontSize: "3rem",
+                  fontWeight: 800,
+                }}
+              >
+                {inicialAlunoPortal || "A"}
+              </div>
+            )}
 
             <p>Resumo financeiro e dados de acesso do aluno.</p>
             <div className="resumoFinanceiroAluno">
@@ -4545,7 +5985,13 @@ function App() {
               </div>
             )}
 
-            <button onClick={() => setModoEditarPerfil(!modoEditarPerfil)}>
+            <button
+              onClick={() => {
+                setNovaSenha("");
+                setConfirmarSenha("");
+                setModoEditarPerfil(!modoEditarPerfil);
+              }}
+            >
               {modoEditarPerfil
                 ? "Cancelar edição"
                 : "Completar meu cadastro"}
@@ -4602,41 +6048,78 @@ function App() {
 
                 <input
                   type="password"
+                  name="novaSenhaPerfilAluno"
                   placeholder="Nova senha"
+                  autoComplete="new-password"
                   value={novaSenha}
                   onChange={(e) => setNovaSenha(e.target.value)}
                 />
 
                 <input
                   type="password"
+                  name="confirmarNovaSenhaPerfilAluno"
                   placeholder="Confirmar nova senha"
+                  autoComplete="new-password"
                   value={confirmarSenha}
                   onChange={(e) => setConfirmarSenha(e.target.value)}
                 />
 
-                <input
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  onChange={async (e) => {
-                    const arquivo = e.target.files[0];
+                <div className="opcoesFotoAluno">
+                  <label htmlFor="fotoPortalAlunoCamera">
+                    Tirar foto
+                  </label>
 
-                    if (arquivo) {
-                      try {
-                        setFoto(await lerImagemCompactada(arquivo));
-                      } catch (error) {
-                        alert(error.message || "Nao foi possivel carregar a foto.");
+                  <input
+                    id="fotoPortalAlunoCamera"
+                    className="inputFotoAluno"
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    onChange={async (e) => {
+                      const arquivo = e.target.files[0];
+                      e.target.value = "";
+
+                      if (arquivo) {
+                        await prepararFotoParaAjuste(arquivo);
                       }
-                    }
-                  }}
-                />
-
-                {foto && (
-                  <img
-                    src={foto}
-                    alt="Foto do aluno"
-                    className="previewFoto"
+                    }}
                   />
+
+                  <label htmlFor="fotoPortalAlunoGaleria">
+                    Escolher da galeria
+                  </label>
+
+                  <input
+                    id="fotoPortalAlunoGaleria"
+                    className="inputFotoAluno"
+                    type="file"
+                    accept="image/*"
+                    onChange={async (e) => {
+                      const arquivo = e.target.files[0];
+                      e.target.value = "";
+
+                      if (arquivo) {
+                        await prepararFotoParaAjuste(arquivo);
+                      }
+                    }}
+                  />
+                </div>
+
+                {fotoAlunoPortal && (
+                  <>
+                    <img
+                      src={fotoAlunoPortal}
+                      alt="Foto do aluno"
+                      className="previewFoto"
+                    />
+
+                    <button
+                      type="button"
+                      onClick={() => abrirAjusteFoto(fotoAlunoPortal)}
+                    >
+                      Ajustar foto
+                    </button>
+                  </>
                 )}
 
                 <button onClick={atualizarPerfilAluno}>
@@ -4688,12 +6171,7 @@ function App() {
                     const leitor = new FileReader();
 
                     leitor.onloadend = () => {
-
-                      informarPagamento(
-                        alunoDoPortal.id,
-                        leitor.result
-                      );
-
+                      setComprovanteSelecionado(leitor.result);
                     };
 
                     leitor.readAsDataURL(arquivo);
@@ -4703,9 +6181,10 @@ function App() {
             </div>
 
             <button
+              disabled={pagamentoEmAndamento}
               onClick={() => informarPagamento(alunoDoPortal.id)}
             >
-              Informar Pagamento
+              {pagamentoEmAndamento ? "Enviando..." : "Informar Pagamento"}
             </button>
 
             <button onClick={() => setMostrarCarteirinhaAluno(!mostrarCarteirinhaAluno)}>
@@ -4734,8 +6213,8 @@ function App() {
                     <strong>{alunoDoPortal?.nome || usuarioLogado?.nome}</strong>
                     <span>Ariramba Jiu-Jitsu School</span>
                     <span>Faixa: {alunoDoPortal?.faixa || "Nao informada"}</span>
-                    <span>Turma: {alunoDoPortal?.turma || "Adultos"}</span>
                     <span>Grau: {alunoDoPortal?.grau || "Nao informado"}</span>
+                    <span>Turma: {alunoDoPortal?.turma || "Adultos"}</span>
                     <span
                       className={
                         verificarVencimento(alunoDoPortal) === "Pago"
@@ -4799,6 +6278,26 @@ function App() {
 
         </main>
 
+        <ModalMensagem
+          modal={modalMensagem}
+          onFechar={fecharModalMensagem}
+        />
+
+        {ajusteFotoAberto && (
+          <AjustadorFoto
+            foto={fotoParaAjustar}
+            zoom={zoomFoto}
+            posicaoX={posicaoFotoX}
+            posicaoY={posicaoFotoY}
+            onZoom={setZoomFoto}
+            onPosicaoX={setPosicaoFotoX}
+            onPosicaoY={setPosicaoFotoY}
+            onTamanhoPreview={setTamanhoPreviewFoto}
+            onCancelar={cancelarAjusteFoto}
+            onConfirmar={confirmarAjusteFoto}
+          />
+        )}
+
       </div>
     );
   }
@@ -4858,7 +6357,7 @@ function App() {
             <div id="readerArquivo" className="readerArquivoOculto"></div>
           </div>
 
-          <button onClick={() => setTela("dashboard")}>
+          <button onClick={() => setTela(tipoUsuario === "professor" ? "portalProfessor" : "dashboard")}>
             Voltar
           </button>
         </main>
@@ -4899,66 +6398,277 @@ function App() {
         </>
       )}
 
-      <main className="conteudoSistema">
+      <main className={`conteudoSistema ${tipoUsuario === "diretor" ? "dashboardDiretor" : ""}`}>
         <button
           className="botaoMenuMobile"
           onClick={() => setMenuAberto(!menuAberto)}
         >
           ☰
         </button>
-        <div className="topoPainel">
+        <div className={`topoPainel ${tipoUsuario === "diretor" ? "topoPainelDiretor" : ""}`}>
 
-          <h1 className="tituloPainel">
-            <span className="statusOnline"></span>
+          <div>
+            <h1 className="tituloPainel">
+              <span className="statusOnline"></span>
 
-            Painel Inicial
-          </h1>
+              {tipoUsuario === "diretor" ? "Painel do Diretor" : "Painel Inicial"}
+            </h1>
 
-          <SubtituloTela>
-            Bem-vindo, {usuarioLogado?.nome}
-          </SubtituloTela>
-
-          <div className="relogioPainel">
-            {horaAtual}
+            <SubtituloTela>
+              Bem-vindo, {usuarioLogado?.nome}
+            </SubtituloTela>
           </div>
 
-          <button
-            className="botaoLogout"
-            onClick={sairDoSistema}
-          >
-            Sair do Sistema
-          </button>
+          <div className={tipoUsuario === "diretor" ? "acoesTopoPainel" : ""}>
+            <div className="relogioPainel">
+              {horaAtual}
+            </div>
+
+            <button
+              className="botaoLogout"
+              onClick={sairDoSistema}
+            >
+              Sair do Sistema
+            </button>
+          </div>
 
         </div>
 
-        <section className="heroPainel">
-          <h3>Bem-vindo ao painel</h3>
-          <h2>ARIRAMBA JIU-JITSU SCHOOL</h2>
-          <p>Gerencie alunos, presenças, pagamentos e relatórios.</p>
+        <section className={`heroPainel ${tipoUsuario === "diretor" ? "heroPainelDiretor" : ""}`}>
+          {tipoUsuario === "diretor" ? (
+            <>
+              <div className="heroConteudoDiretor">
+                <span className="etiquetaDashboard">Gestão administrativa</span>
+                <h2>ARIRAMBA JIU-JITSU SCHOOL</h2>
+                <p>Visão executiva de alunos, presenças, turmas e financeiro.</p>
+              </div>
+
+              <div className="heroResumoDiretor">
+                <div>
+                  <span>Recebido</span>
+                  <strong>{formatarMoeda(totalArrecadado)}</strong>
+                </div>
+
+                <div>
+                  <span>A receber</span>
+                  <strong>{formatarMoeda(totalPendenteReceber)}</strong>
+                </div>
+
+                <div>
+                  <span>Previsão mensal</span>
+                  <strong>{formatarMoeda(valorEsperadoMes)}</strong>
+                </div>
+              </div>
+            </>
+          ) : (
+            <>
+              <h3>Bem-vindo ao painel</h3>
+              <h2>ARIRAMBA JIU-JITSU SCHOOL</h2>
+              <p>Gerencie alunos, presenças, pagamentos e relatórios.</p>
+            </>
+          )}
         </section>
 
-        <div className="cardAluno">
-          <h2>Notificações do Sistema</h2>
+        <div className={`estatisticas ${tipoUsuario === "diretor" ? "estatisticasDiretor" : ""}`}>
+          <CardEstatistica
+            titulo="Total de Alunos"
+            valor={alunos.length}
+          />
 
-          {avisosDoPainel.length === 0 ? (
-            <p>Nenhuma notificação no momento.</p>
-          ) : (
-            avisosDoPainel.slice(0, 5).map((aviso) => (
-              <p key={aviso.id}>
-                {aviso.mensagem} - {aviso.data}
-              </p>
-            ))
+          <CardEstatistica
+            titulo="Presenças Hoje"
+            valor={presencasHoje}
+          />
+
+          <CardEstatistica
+            titulo="Turma Kids"
+            valor={totalKids}
+          />
+
+          <CardEstatistica
+            titulo="Turma Adultos"
+            valor={totalAdultos}
+          />
+
+          {tipoUsuario === "diretor" && (
+            <>
+              <CardEstatistica
+                titulo="Mensalidades Pagas"
+                valor={totalPagos}
+              />
+
+              <CardEstatistica
+                titulo="Mensalidades Pendentes"
+                valor={totalPendentes}
+              />
+
+              <CardEstatistica
+                titulo="Mensalidades Vencidas"
+                valor={totalVencidos}
+              />
+
+              <CardEstatistica
+                titulo="Aguardando Confirmação"
+                valor={pagamentosAguardando.length}
+              />
+            </>
           )}
-
-          <button onClick={() => setAvisos([])}>
-            Limpar notificações
-          </button>
 
         </div>
 
         {tipoUsuario === "diretor" && (
-          <>
-            <div className="cardAluno armazenamentoLocal">
+          <section className="dashboardGraficosDiretor">
+            <article className="cardDashboardDiretor graficoResumoFinanceiro">
+              <div className="cabecalhoCardDashboard">
+                <span>Financeiro</span>
+                <h2>Resumo das mensalidades</h2>
+              </div>
+
+              <div className="listaBarrasDashboard">
+                {resumoFinanceiroDashboard.map((item) => (
+                  <div className="linhaBarraDashboard" key={item.rotulo}>
+                    <div className="linhaBarraTexto">
+                      <span>{item.rotulo}</span>
+                      <strong>{item.valor}</strong>
+                    </div>
+
+                    <div className="trilhoBarraDashboard">
+                      <span
+                        className={`preenchimentoBarraDashboard ${item.classe}`}
+                        style={{ width: `${Math.max((item.valor / maxResumoFinanceiro) * 100, item.valor > 0 ? 8 : 0)}%` }}
+                      ></span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </article>
+
+            <article className="cardDashboardDiretor graficoArrecadacao">
+              <div className="cabecalhoCardDashboard">
+                <span>Receita</span>
+                <h2>Arrecadação mensal</h2>
+              </div>
+
+              {arrecadacaoMensalDashboard.length === 0 ? (
+                <p className="estadoVazioDashboard">
+                  Sem pagamentos confirmados com data para exibir.
+                </p>
+              ) : (
+                <div className="graficoColunasDashboard">
+                  {arrecadacaoMensalDashboard.map((item) => (
+                    <div className="colunaDashboard" key={item.chave}>
+                      <div className="colunaValorDashboard">
+                        {formatarMoeda(item.valor)}
+                      </div>
+
+                      <span
+                        className="colunaPreenchimentoDashboard"
+                        style={{ height: `${Math.max((item.valor / maxArrecadacaoMensalDashboard) * 100, 12)}%` }}
+                      ></span>
+
+                      <small>{item.rotulo}</small>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </article>
+
+            <article className="cardDashboardDiretor graficoPresenca">
+              <div className="cabecalhoCardDashboard">
+                <span>Presença</span>
+                <h2>Kids x Adulto hoje</h2>
+              </div>
+
+              <div className="listaBarrasDashboard">
+                {presencaTurmasDashboard.map((item) => (
+                  <div className="linhaBarraDashboard" key={item.rotulo}>
+                    <div className="linhaBarraTexto">
+                      <span>{item.rotulo}</span>
+                      <strong>{item.valor}</strong>
+                    </div>
+
+                    <div className="trilhoBarraDashboard">
+                      <span
+                        className="preenchimentoBarraDashboard presenca"
+                        style={{ width: `${Math.max((item.valor / maxPresencasTurmaDashboard) * 100, item.valor > 0 ? 8 : 0)}%` }}
+                      ></span>
+                    </div>
+
+                    <small>{item.alunos} aluno(s) na turma</small>
+                  </div>
+                ))}
+              </div>
+            </article>
+
+            <article className="cardDashboardDiretor graficoCadastros">
+              <div className="cabecalhoCardDashboard">
+                <span>Cadastros</span>
+                <h2>Evolução de alunos</h2>
+              </div>
+
+              <p className="estadoVazioDashboard">
+                A fonte atual dos alunos não traz uma data confiável de cadastro.
+              </p>
+            </article>
+          </section>
+        )}
+
+        <section className={tipoUsuario === "diretor" ? "dashboardOperacionalDiretor" : ""}>
+          <div className={`cardAluno ${tipoUsuario === "diretor" ? "cardDashboardDiretor notificacoesDashboard" : ""}`}>
+            {tipoUsuario === "diretor" ? (
+              <div className="cabecalhoCardDashboard">
+                <span>Alertas</span>
+                <h2>Notificações do Sistema</h2>
+              </div>
+            ) : (
+              <h2>Notificações do Sistema</h2>
+            )}
+
+            {avisosDoPainel.length === 0 ? (
+              <p>Nenhuma notificação no momento.</p>
+            ) : (
+              avisosDoPainel.slice(0, 5).map((aviso) => (
+                <p key={aviso.id}>
+                  {aviso.mensagem} - {aviso.data}
+                </p>
+              ))
+            )}
+
+            <button onClick={() => setAvisos([])}>
+              Limpar notificações
+            </button>
+
+          </div>
+
+          {tipoUsuario === "diretor" && (
+            <div className="cardDashboardDiretor atividadesDashboard">
+              <div className="cabecalhoCardDashboard">
+                <span>Movimento</span>
+                <h2>Atividades recentes</h2>
+              </div>
+
+              {atividadesRecentesDashboard.length === 0 ? (
+                <p className="estadoVazioDashboard">
+                  Nenhuma atividade registrada até o momento.
+                </p>
+              ) : (
+                <div className="listaAtividadesDashboard">
+                  {atividadesRecentesDashboard.map((atividade) => (
+                    <div className="itemAtividadeDashboard" key={atividade.id}>
+                      <span>{atividade.tipo}</span>
+                      <strong>{atividade.titulo}</strong>
+                      <small>{atividade.detalhe}</small>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+
+        {tipoUsuario === "diretor" && (
+          <section className="dashboardAdministracaoDiretor">
+            <div className="cardAluno cardDashboardDiretor armazenamentoLocal">
               <h2>Acesso do Mestre</h2>
 
               <p>
@@ -5079,108 +6789,28 @@ function App() {
                 onChange={importarBackup}
               />
             </div>
-          </>
+          </section>
         )}
-
-        <div className="estatisticas">
-          <CardEstatistica
-            titulo="Total de Alunos"
-            valor={alunos.length}
-          />
-
-          <CardEstatistica
-            titulo="Presenças Hoje"
-            valor={presencasHoje}
-          />
-
-          <CardEstatistica
-            titulo="Turma Kids"
-            valor={totalKids}
-          />
-
-          <CardEstatistica
-            titulo="Turma Adultos"
-            valor={totalAdultos}
-          />
-
-          {tipoUsuario === "diretor" && (
-            <>
-              <CardEstatistica
-                titulo="Mensalidades Pagas"
-                valor={totalPagos}
-              />
-
-              <CardEstatistica
-                titulo="Mensalidades Pendentes"
-                valor={totalPendentes}
-              />
-
-              <CardEstatistica
-                titulo="Mensalidades Vencidas"
-                valor={totalVencidos}
-              />
-
-              <CardEstatistica
-                titulo="Aguardando Confirmação"
-                valor={pagamentosAguardando.length}
-              />
-            </>
-          )}
-
-        </div>
-
-        <div className="cardAluno graficoDashboard">
-          <h2>Visão Geral da Academia</h2>
-
-          <div className="barraGrafico">
-            <span>Alunos</span>
-            <div>
-              <p
-                className="barra alunosBarra"
-                style={{ width: `${alunos.length * 10}px` }}
-              ></p>
-            </div>
-            <strong>{alunos.length}</strong>
-          </div>
-
-          {tipoUsuario === "diretor" && (
-            <>
-              <div className="barraGrafico">
-                <span>Pagos</span>
-                <div>
-                  <p
-                    className="barra pagosBarra"
-                    style={{ width: `${totalPagos * 10}px` }}
-                  ></p>
-                </div>
-                <strong>{totalPagos}</strong>
-              </div>
-
-              <div className="barraGrafico">
-                <span>Pendentes</span>
-                <div>
-                  <p
-                    className="barra pendentesBarra"
-                    style={{ width: `${totalPendentes * 10}px` }}
-                  ></p>
-                </div>
-                <strong>{totalPendentes}</strong>
-              </div>
-
-              <div>
-                <p
-                  className="barra vencidosBarra"
-                  style={{ width: `${totalVencidos * 10}px` }}
-                ></p>
-              </div>
-            </>
-          )}
-        </div>
 
         <div className="cardsDashboard">
           {tipoUsuario === "diretor" && (
-            <button onClick={() => setTela("cadastro")}>
+            <button
+              onClick={() => {
+                limparFormulario();
+                setTela("cadastro");
+              }}
+            >
               Cadastrar Aluno
+            </button>
+          )}
+          {tipoUsuario === "diretor" && (
+            <button
+              onClick={() => {
+                limparFormulario();
+                setTela("cadastroProfessor");
+              }}
+            >
+              Cadastrar Professor
             </button>
           )}
           <button onClick={() => setTela("lista")}>Lista de Alunos</button>
@@ -5367,13 +6997,23 @@ function App() {
         )}
 
         {tipoUsuario === "diretor" && (
-          <button onClick={() => navegar("cadastro")}>
+          <button
+            onClick={() => {
+              limparFormulario();
+              navegar("cadastro");
+            }}
+          >
             Cadastrar Aluno
           </button>
         )}
 
         {tipoUsuario === "diretor" && (
-          <button onClick={() => navegar("cadastroProfessor")}>
+          <button
+            onClick={() => {
+              limparFormulario();
+              navegar("cadastroProfessor");
+            }}
+          >
             Cadastrar Professor
           </button>
         )}
@@ -5423,5 +7063,3 @@ function App() {
 }
 
 export default App;
-
-

@@ -44,7 +44,7 @@ const COLUNAS_ALUNO_LISTA = [
   "medicamentos",
   "observacoes",
   "observacao_financeira",
-  "auth_user_id",
+  "foto_url",
 ].join(",");
 
 const COLUNAS_ALUNO_LISTA_SEM_AUTH = COLUNAS_ALUNO_LISTA
@@ -218,6 +218,32 @@ export async function buscarUsuarioSistemaOnline(usuario) {
     nome: data.nome,
     alunoId: data.aluno_id,
     academiaId: data.academia_id,
+    fotoUrl: data.foto_url || "",
+    origem: "usuarios_sistema",
+  };
+}
+
+export async function buscarUsuarioSistemaOnlinePorAluno(idAluno) {
+  exigirSupabase();
+
+  const { data, error } = await supabase
+    .from("usuarios_sistema")
+    .select("*")
+    .eq("aluno_id", idAluno)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data) return null;
+
+  return {
+    id: data.id,
+    usuario: data.usuario,
+    senha: data.senha,
+    cargo: data.cargo,
+    nome: data.nome,
+    alunoId: data.aluno_id,
+    academiaId: data.academia_id,
+    fotoUrl: data.foto_url || "",
     origem: "usuarios_sistema",
   };
 }
@@ -232,6 +258,7 @@ export async function salvarUsuarioSistemaOnline(usuario) {
     nome: usuario.nome,
     aluno_id: usuario.alunoId || null,
     academia_id: usuario.academiaId || null,
+    foto_url: usuario.fotoUrl || usuario.foto_url || null,
   };
 
   linha.academia_id = linha.academia_id || (await obterAcademiaAtual()) || undefined;
@@ -254,17 +281,39 @@ export async function salvarUsuarioSistemaOnline(usuario) {
         .maybeSingle());
     }
 
+    if (erroColunaInexistente(error, "foto_url")) {
+      delete linha.foto_url;
+      ({ data, error } = await supabase
+        .from("usuarios_sistema")
+        .update(linha)
+        .eq("id", usuario.id)
+        .select()
+        .maybeSingle());
+    }
+
     if (error) throw error;
     if (data) return data;
   }
 
   const { data: existente, error: erroBusca } = await supabase
     .from("usuarios_sistema")
-    .select("id")
+    .select("id,aluno_id,cargo")
     .ilike("usuario", usuario.usuario)
     .maybeSingle();
 
   if (erroBusca) throw erroBusca;
+
+  if (existente) {
+    const mesmoId = usuario.id && String(existente.id) === String(usuario.id);
+    const mesmoAluno =
+      usuario.alunoId &&
+      existente.aluno_id &&
+      String(existente.aluno_id) === String(usuario.alunoId);
+
+    if (!mesmoId && !mesmoAluno) {
+      throw new Error("Este usuario ja existe no banco online. Escolha outro usuario.");
+    }
+  }
 
   async function salvarLinhaUsuario(linhaUsuario) {
     if (existente) {
@@ -287,6 +336,11 @@ export async function salvarUsuarioSistemaOnline(usuario) {
 
   if (erroColunaInexistente(error, "academia_id")) {
     delete linha.academia_id;
+    ({ data, error } = await salvarLinhaUsuario(linha));
+  }
+
+  if (erroColunaInexistente(error, "foto_url")) {
+    delete linha.foto_url;
     ({ data, error } = await salvarLinhaUsuario(linha));
   }
 
