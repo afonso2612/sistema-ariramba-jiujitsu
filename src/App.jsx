@@ -83,6 +83,10 @@ function normalizarAluno(aluno) {
   };
 }
 
+function obterFotoAluno(aluno) {
+  return aluno?.foto || aluno?.fotoUrl || aluno?.foto_url || "";
+}
+
 function aplicarPresencasNosAlunos(alunos, presencas) {
   return alunos.map((aluno) => ({
     ...aluno,
@@ -4755,7 +4759,7 @@ function App() {
                   id="fotoAlunoGaleria"
                   className="inputFotoAluno"
                   type="file"
-                  accept="image/*"
+                  accept="image/jpeg,image/png,image/webp"
                   onChange={async (e) => {
                     const arquivo = e.target.files[0];
                     e.target.value = "";
@@ -4861,9 +4865,9 @@ function App() {
               alunosFiltrados.map((aluno) => (
                 <CardAluno key={aluno.id}>
 
-                  {aluno.foto && (
+                  {obterFotoAluno(aluno) && (
                     <img
-                      src={aluno.foto}
+                      src={obterFotoAluno(aluno)}
                       alt={aluno.nome}
                       className="fotoAlunoLista"
                     />
@@ -5804,7 +5808,7 @@ function App() {
                     id="fotoProfessorGaleria"
                     className="inputFotoAluno"
                     type="file"
-                    accept="image/*"
+                    accept="image/jpeg,image/png,image/webp"
                     onChange={async (e) => {
                       const arquivo = e.target.files[0];
                       e.target.value = "";
@@ -6093,7 +6097,7 @@ function App() {
                     id="fotoPortalAlunoGaleria"
                     className="inputFotoAluno"
                     type="file"
-                    accept="image/*"
+                    accept="image/jpeg,image/png,image/webp"
                     onChange={async (e) => {
                       const arquivo = e.target.files[0];
                       e.target.value = "";
