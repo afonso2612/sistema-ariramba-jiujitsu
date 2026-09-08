@@ -1578,11 +1578,9 @@ function App() {
     }
 
     sincronizarPainel();
-    const intervalo = setInterval(sincronizarPainel, tela === "portalAluno" ? 5000 : 10000);
 
     return () => {
       componenteAtivo = false;
-      clearInterval(intervalo);
     };
   }, [tela, usuarioOnlineLogado, usuarioLogado?.id, usuarioLogado?.academiaId]);
 
