@@ -56,6 +56,7 @@ create table if not exists public.pagamentos (
   status text not null default 'Pendente'
     check (status in ('Pendente', 'Aguardando', 'Pago', 'Rejeitado')),
   data_pagamento date,
+  competencia text,
   comprovante_url text,
   observacao text,
   confirmado_por uuid references auth.users(id) on delete set null,

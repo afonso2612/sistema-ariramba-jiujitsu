@@ -5,8 +5,10 @@ import { QRCodeCanvas } from "qrcode.react";
 import { Html5Qrcode } from "html5-qrcode";
 import capa from "./assets/capa.webp";
 import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
 import { supabase, supabaseConfigurado } from "./lib/supabaseClient";
 import { entrarComEmailSenha, obterPerfilSupabase, sairDoSupabase } from "./services/supabaseAuth";
+import { validarComprovante, enviarPagamentoComComprovante, obterUrlComprovante } from "./services/comprovantes";
 import {
   buscarUsuarioSistemaOnline,
   buscarUsuarioSistemaOnlinePorAluno,
@@ -129,6 +131,23 @@ function dataPagamentoParaTempo(pagamento) {
   return new Date(pagamento.criado_em || pagamento.data_pagamento || 0).getTime();
 }
 
+function obterCompetenciaAtual() {
+  const agora = new Date();
+  const ano = agora.getFullYear();
+  const mes = String(agora.getMonth() + 1).padStart(2, "0");
+  return ano + "-" + mes;
+}
+
+function formatarCompetencia(competencia) {
+  const [ano, mes] = String(competencia || "").split("-");
+  const nomesMeses = ["Janeiro", "Fevereiro", "Marco", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"];
+
+  const indiceMes = Number(mes) - 1;
+  if (!ano || indiceMes < 0 || indiceMes > 11) return competencia || "";
+
+  return `${nomesMeses[indiceMes]}/${ano}`;
+}
+
 function obterUltimoPagamentoDoAluno(pagamentos, idAluno) {
   return pagamentos
     .filter((pagamento) => String(pagamento.aluno_id) === String(idAluno))
@@ -139,11 +158,22 @@ function comprovanteEhImagem(comprovante) {
   return typeof comprovante === "string" && comprovante.startsWith("data:image/");
 }
 
-function abrirArquivoComprovante(comprovante) {
+async function abrirArquivoComprovante(comprovante) {
   if (!comprovante) return;
 
   if (!comprovante.startsWith("data:")) {
-    window.open(comprovante, "_blank", "noopener,noreferrer");
+    const janela = window.open("about:blank", "_blank");
+    if (janela) janela.opener = null;
+    try {
+      const url = /^https?:\/\//i.test(comprovante)
+        ? comprovante
+        : await obterUrlComprovante(comprovante);
+      if (janela) janela.location.replace(url);
+      else alert("Permita abrir novas abas e tente novamente.");
+    } catch (error) {
+      janela?.close();
+      alert(`Não foi possível abrir o comprovante: ${error.message}`);
+    }
     return;
   }
 
@@ -366,9 +396,19 @@ function aplicarPagamentosNosAlunos(alunos, pagamentos) {
     const pagos = pagamentosDoAluno
       .filter((pagamento) => pagamento.status === "Pago")
       .sort((a, b) => dataPagamentoParaTempo(b) - dataPagamentoParaTempo(a));
-    const ultimoPagamento = obterUltimoPagamentoDoAluno(pagamentos, aluno.id);
+    const competenciaAtual = obterCompetenciaAtual();
+    const pagamentoCompetenciaAtual = pagamentosDoAluno
+      .filter((pagamento) => {
+        if (pagamento.competencia) {
+          return pagamento.competencia === competenciaAtual;
+        }
+
+        const dataReferencia = String(pagamento.data_pagamento || pagamento.criado_em || "").slice(0, 7);
+        return dataReferencia === competenciaAtual;
+      })
+      .sort((a, b) => dataPagamentoParaTempo(b) - dataPagamentoParaTempo(a))[0];
     const aguardando =
-      ultimoPagamento?.status === "Aguardando" ? ultimoPagamento : null;
+      pagamentoCompetenciaAtual?.status === "Aguardando" ? pagamentoCompetenciaAtual : null;
     const ultimoComprovante = pagamentosDoAluno
       .filter((pagamento) => pagamento.comprovante_url)
       .sort((a, b) => dataPagamentoParaTempo(b) - dataPagamentoParaTempo(a))[0];
@@ -376,7 +416,7 @@ function aplicarPagamentosNosAlunos(alunos, pagamentos) {
 
     return {
       ...aluno,
-      statusPagamento: ultimoPagamento?.status || aluno.statusPagamento,
+      statusPagamento: pagamentoCompetenciaAtual?.status || "Pendente",
       comprovantePagamento:
         aguardando?.comprovante_url ||
         ultimoComprovante?.comprovante_url ||
@@ -762,6 +802,7 @@ function App() {
 
   const [usuario, setUsuario] = useState("");
   const [senha, setSenha] = useState("");
+  const [mostrarSenhaLogin, setMostrarSenhaLogin] = useState(false);
   const [tipoUsuario, setTipoUsuario] = useState("");
   const [usuarioLogado, setUsuarioLogado] = useState(null);
 
@@ -1151,6 +1192,7 @@ function App() {
     );
   });
   const [pagamentos, setPagamentos] = useState([]);
+  const [competenciaSelecionada, setCompetenciaSelecionada] = useState(obterCompetenciaAtual);
 
   async function carregarDadosOnlineNoEstado() {
     const [alunosOnline, presencasOnline, pagamentosOnline] = await Promise.all([
@@ -1376,7 +1418,7 @@ function App() {
             String(aluno.id) === String(idAlunoLido) ||
             normalizarTextoBusca(aluno.usuario) === chaveBuscaQRCode ||
             normalizarTextoBusca(aluno.nome) === chaveBuscaQRCode
-        ) || (alunoOnlinePorUsuario ? normalizarAluno(alunoOnlinePorUsuario) : null);
+        ) || (alunoOnlinePorUsuario ? aplicarPagamentosNosAlunos([normalizarAluno(alunoOnlinePorUsuario)], pagamentosOnline)[0] : null);
       } catch (error) {
         console.error("Erro ao buscar aluno do QR online.", error);
       }
@@ -1985,9 +2027,9 @@ function App() {
             aluno_id: idAluno,
             valor: calcularValorComJuros(alunoPago),
             status: "Pago",
+            competencia: pagamentoAguardando?.competencia || obterCompetenciaAtual(),
             data_pagamento: new Date().toISOString().slice(0, 10),
             comprovante_url:
-              alunoPago.comprovantePagamento ||
               pagamentoAguardando?.comprovante_url ||
               null,
           }),
@@ -2028,12 +2070,19 @@ function App() {
 
     if (diretorOnlineLogado) {
       try {
+        const pagamentoPagoAtual = obterPagamentoPagoNoCicloAtual(idAluno);
+        if (!pagamentoPagoAtual?.id) {
+          alert("Nao foi encontrado um pagamento confirmado nesta competencia.");
+          return;
+        }
         await Promise.all([
           salvarAlunoOnline(alunoAtualizado),
           salvarPagamentoOnline({
+            id: pagamentoPagoAtual.id,
             aluno_id: idAluno,
             valor: Number(alunoAtualizado.mensalidade || 0),
             status: "Pendente",
+            competencia: pagamentoPagoAtual.competencia || obterCompetenciaAtual(),
             data_pagamento: null,
           }),
         ]);
@@ -2600,12 +2649,18 @@ function App() {
     pagamentoEmAndamentoRef.current = true;
     setPagamentoEmAndamento(true);
     const comprovanteParaEnvio = comprovante ?? comprovanteSelecionado;
+    if (comprovanteParaEnvio && !usuarioOnlineLogado) {
+      pagamentoEmAndamentoRef.current = false;
+      setPagamentoEmAndamento(false);
+      abrirModalMensagem({ tipo: "erro", titulo: "Autenticação necessária", mensagem: "Entre com sua conta autenticada para enviar comprovantes." });
+      return;
+    }
     const novosAlunos = alunos.map((aluno) => {
       if (aluno.id === idAluno) {
         return {
           ...aluno,
           statusPagamento: "Aguardando",
-          comprovantePagamento: comprovanteParaEnvio,
+          comprovantePagamento: aluno.comprovantePagamento,
           dataEnvioComprovante: new Date().toLocaleDateString(),
         };
       }
@@ -2643,22 +2698,20 @@ function App() {
           return;
         }
 
-        await Promise.all([
-          salvarAlunoOnline(alunoAtualizado),
-          salvarPagamentoOnline({
-            ...(pagamentoAguardando?.id ? { id: pagamentoAguardando.id } : {}),
-            aluno_id: idAluno,
-            valor: Number(alunoAtualizado.mensalidade || 0),
-            status: "Aguardando",
-            data_pagamento:
-              pagamentoAguardando?.data_pagamento ||
-              new Date().toISOString().slice(0, 10),
-            comprovante_url:
-              comprovanteParaEnvio ||
-              pagamentoAguardando?.comprovante_url ||
-              null,
-          }),
-        ]);
+        const pagamento = {
+          ...(pagamentoAguardando?.id ? { id: pagamentoAguardando.id } : {}),
+          aluno_id: idAluno,
+          valor: Number(alunoAtualizado.mensalidade || 0),
+          status: "Aguardando",
+          competencia: pagamentoAguardando?.competencia || obterCompetenciaAtual(),
+          data_pagamento: pagamentoAguardando?.data_pagamento || new Date().toISOString().slice(0, 10),
+          comprovante_url: pagamentoAguardando?.comprovante_url || null,
+        };
+        if (comprovanteParaEnvio) {
+          alunoAtualizado.comprovantePagamento = await enviarPagamentoComComprovante(pagamento, comprovanteParaEnvio);
+        } else {
+          await Promise.all([salvarAlunoOnline(alunoAtualizado), salvarPagamentoOnline(pagamento)]);
+        }
         setAlunos(novosAlunos);
         await carregarDadosOnlineNoEstado();
       } catch (error) {
@@ -2709,12 +2762,19 @@ function App() {
 
     if (diretorOnlineLogado) {
       try {
+        const pagamentoAguardandoAtual = obterPagamentoAguardandoAberto(idAluno);
+        if (!pagamentoAguardandoAtual?.id) {
+          alert("Nao foi encontrado um pagamento aguardando nesta competencia.");
+          return;
+        }
         await Promise.all([
           salvarAlunoOnline(alunoAtualizado),
           salvarPagamentoOnline({
+            id: pagamentoAguardandoAtual.id,
             aluno_id: idAluno,
             valor: Number(alunoAtualizado.mensalidade || 0),
             status: "Rejeitado",
+            competencia: pagamentoAguardandoAtual.competencia || obterCompetenciaAtual(),
             data_pagamento: new Date().toISOString().slice(0, 10),
           }),
         ]);
@@ -2735,33 +2795,173 @@ function App() {
     alert("Comprovante rejeitado.");
   }
 
-  function gerarReciboPDF(aluno) {
-    const doc = new jsPDF();
+  async function gerarReciboPDF(aluno) {
+    if (!aluno) {
+      alert("Aluno nao encontrado.");
+      return;
+    }
 
-    const dataAtual = new Date().toLocaleDateString();
+    const doc = new jsPDF({
+      orientation: "portrait",
+      unit: "mm",
+      format: "a4",
+    });
+
+    const dataAtual = new Date().toLocaleDateString("pt-BR");
     const valorPago = calcularValorComJuros(aluno);
 
-    doc.setFontSize(18);
-    doc.text("RECIBO DE PAGAMENTO", 20, 20);
+    let imagemLogo = null;
 
-    doc.setFontSize(12);
-    doc.text("Ariramba Jiu-Jitsu School", 20, 35);
-    doc.text(`Aluno: ${aluno.nome}`, 20, 50);
-    doc.text(`Data do pagamento: ${dataAtual}`, 20, 60);
-    doc.text(`Valor pago: ${formatarMoeda(valorPago)}`, 20, 70);
-    doc.text("Status: Pago", 20, 80);
+    try {
+      imagemLogo = await carregarImagem(logo);
+    } catch (error) {
+      console.error("Erro ao carregar logo para o recibo.", error);
+    }
+
+    const paginaLargura = doc.internal.pageSize.getWidth();
+    const paginaAltura = doc.internal.pageSize.getHeight();
+
+    if (imagemLogo) {
+      const larguraMarcaDagua = 95;
+      const alturaMarcaDagua = 95;
+
+      doc.saveGraphicsState();
+      doc.setGState(new doc.GState({ opacity: 0.045 }));
+      doc.addImage(
+        imagemLogo,
+        "WEBP",
+        (paginaLargura - larguraMarcaDagua) / 2,
+        (paginaAltura - alturaMarcaDagua) / 2,
+        larguraMarcaDagua,
+        alturaMarcaDagua
+      );
+      doc.restoreGraphicsState();
+    }
+
+    doc.setFillColor(15, 23, 42);
+    doc.rect(0, 0, paginaLargura, 42, "F");
+
+    if (imagemLogo) {
+      doc.addImage(imagemLogo, "WEBP", 15, 8, 26, 26);
+    }
+
+    doc.setTextColor(255, 255, 255);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(16);
+    doc.text("ARIRAMBA JIU-JITSU SCHOOL", 46, 17);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.text("RECIBO DE PAGAMENTO", 46, 25);
+
+    doc.setTextColor(245, 158, 11);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8);
+    doc.text("COMPROVANTE DE PAGAMENTO", paginaLargura - 15, 34, {
+      align: "right",
+    });
+
+    doc.setDrawColor(245, 158, 11);
+    doc.setLineWidth(0.8);
+    doc.line(15, 42, paginaLargura - 15, 42);
+
+    doc.setTextColor(15, 23, 42);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(11);
+    doc.text("RECIBO DE PAGAMENTO", 20, 60);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    doc.setTextColor(71, 85, 105);
 
     doc.text(
-      "Declaramos que o pagamento da mensalidade foi recebido com sucesso.",
+      "Declaramos que recebemos o pagamento da mensalidade",
       20,
-      100
+      70
+    );
+    doc.text(
+      "referente ao aluno identificado abaixo.",
+      20,
+      77
     );
 
-    doc.text("Assinatura: _______________________________", 20, 130);
+    doc.setFillColor(248, 250, 252);
+    doc.setDrawColor(226, 232, 240);
+    doc.roundedRect(20, 90, paginaLargura - 40, 48, 4, 4, "FD");
 
-    doc.save(`recibo-${aluno.nome}.pdf`);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9);
+    doc.setTextColor(100, 116, 139);
+
+    doc.text("ALUNO", 28, 101);
+    doc.text("DATA DO PAGAMENTO", 28, 116);
+    doc.text("STATUS", 125, 101);
+    doc.text("VALOR PAGO", 125, 116);
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(11);
+    doc.setTextColor(15, 23, 42);
+
+    doc.text(String(aluno.nome || "-"), 28, 108);
+    doc.text(dataAtual, 28, 123);
+
+    doc.setTextColor(22, 163, 74);
+    doc.text("PAGO", 125, 108);
+
+    doc.setFontSize(14);
+    doc.text(formatarMoeda(valorPago), 125, 125);
+
+    doc.setTextColor(71, 85, 105);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+
+    doc.text(
+      "O pagamento foi registrado com sucesso no sistema.",
+      20,
+      158
+    );
+
+    doc.text(
+      "Este documento serve como comprovante do pagamento realizado.",
+      20,
+      166
+    );
+
+    doc.setDrawColor(226, 232, 240);
+    doc.line(20, 181, paginaLargura - 20, 181);
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9);
+    doc.setTextColor(15, 23, 42);
+    doc.text("Ariramba Jiu-Jitsu School", 20, 194);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(100, 116, 139);
+
+    doc.text(
+      `Emitido em ${dataAtual}`,
+      20,
+      201
+    );
+
+    doc.text(
+      "Documento gerado eletronicamente pelo sistema.",
+      20,
+      208
+    );
+
+    doc.setTextColor(148, 163, 184);
+    doc.setFontSize(7);
+    doc.text(
+      "Ariramba Jiu-Jitsu School",
+      paginaLargura / 2,
+      paginaAltura - 12,
+      { align: "center" }
+    );
+
+    doc.save(`recibo-${normalizarNomeArquivo(aluno.nome)}.pdf`);
   }
-
   function gerarRelatorioFinanceiroPDF() {
     const doc = new jsPDF();
     let y = 20;
@@ -2843,6 +3043,177 @@ function App() {
     doc.save("relatorio-financeiro-ariramba.pdf");
   }
 
+  async function gerarRelatorioPagamentosPDF() {
+    const resumo = obterResumoCompetencia(competenciaSelecionada);
+    const doc = new jsPDF({
+      orientation: "landscape",
+      unit: "mm",
+      format: "a4",
+    });
+
+    let imagemMarcaDagua = null;
+
+    try {
+      imagemMarcaDagua = await carregarImagem(logo);
+    } catch (error) {
+      console.error("Erro ao carregar logo para marca d'agua do PDF.", error);
+    }
+
+    function adicionarMarcaDagua() {
+      if (!imagemMarcaDagua) return;
+
+      const paginaLargura = doc.internal.pageSize.getWidth();
+      const paginaAltura = doc.internal.pageSize.getHeight();
+      const largura = 75;
+      const altura = 75;
+
+      doc.saveGraphicsState();
+      doc.setGState(new doc.GState({ opacity: 0.05 }));
+      doc.addImage(
+        imagemMarcaDagua,
+        "WEBP",
+        (paginaLargura - largura) / 2,
+        (paginaAltura - altura) / 2,
+        largura,
+        altura
+      );
+      doc.restoreGraphicsState();
+    }
+
+    const competenciaFormatada = formatarCompetencia(competenciaSelecionada);
+
+    const linhasAlunos = resumo.detalhes
+      .slice()
+      .sort((a, b) =>
+        String(a.aluno.nome || "").localeCompare(String(b.aluno.nome || ""))
+      )
+      .map((item, indice) => {
+        const dataPagamento =
+          item.pagamento?.data_pagamento || item.pagamento?.criado_em || "";
+
+        const dataFormatada = dataPagamento
+          ? dataISOParaBrasil(String(dataPagamento).slice(0, 10))
+          : "-";
+
+        const valorPago =
+          item.pagamento?.status === "Pago"
+            ? formatarMoeda(item.valorPago)
+            : "-";
+
+        return [
+          indice + 1,
+          item.aluno.nome || "-",
+          formatarMoeda(item.mensalidade),
+          item.status,
+          valorPago,
+          dataFormatada,
+        ];
+      });
+
+    autoTable(doc, {
+      startY: 42,
+      margin: { top: 42, right: 12, bottom: 16, left: 12 },
+      head: [
+        [
+          "Nº",
+          "Aluno",
+          "Mensalidade",
+          "Situação",
+          "Valor pago",
+          "Data",
+        ],
+      ],
+      body: linhasAlunos,
+      theme: "grid",
+      styles: {
+        fontSize: 8.5,
+        cellPadding: 2.2,
+        valign: "middle",
+        overflow: "linebreak",
+      },
+      headStyles: {
+        fontStyle: "bold",
+        halign: "center",
+      },
+      columnStyles: {
+        0: { cellWidth: 12, halign: "center" },
+        1: { cellWidth: 105 },
+        2: { cellWidth: 38, halign: "right" },
+        3: { cellWidth: 32, halign: "center" },
+        4: { cellWidth: 38, halign: "right" },
+        5: { cellWidth: 32, halign: "center" },
+      },
+      didDrawPage: () => {
+        adicionarMarcaDagua();
+
+        const paginaLargura = doc.internal.pageSize.getWidth();
+
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(15);
+        doc.text("ARIRAMBA JIU-JITSU SCHOOL", 12, 13);
+
+        doc.setFontSize(11);
+        doc.text(
+          `RELATÓRIO DE PAGAMENTOS - ${competenciaFormatada.toUpperCase()}`,
+          12,
+          20
+        );
+
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(8);
+        doc.text(
+          `Emitido em: ${new Date().toLocaleString()}`,
+          paginaLargura - 12,
+          13,
+          { align: "right" }
+        );
+
+        doc.setFontSize(9);
+        doc.text(`Previsto: ${formatarMoeda(resumo.previsto)}`, 12, 30);
+        doc.text(`Recebido: ${formatarMoeda(resumo.recebido)}`, 62, 30);
+        doc.text(`Restante: ${formatarMoeda(resumo.restante)}`, 112, 30);
+
+        doc.text(`Alunos: ${resumo.detalhes.length}`, 172, 30);
+        doc.text(`Pagos: ${resumo.pagos}`, 202, 30);
+        doc.text(`Pendentes: ${resumo.pendentes}`, 227, 30);
+        doc.text(`Vencidos: ${resumo.vencidos}`, 260, 30);
+
+        doc.setDrawColor(180);
+        doc.line(12, 35, paginaLargura - 12, 35);
+      },
+    });
+
+    const totalPaginas = doc.getNumberOfPages();
+
+    for (let pagina = 1; pagina <= totalPaginas; pagina += 1) {
+      doc.setPage(pagina);
+
+      const paginaLargura = doc.internal.pageSize.getWidth();
+      const paginaAltura = doc.internal.pageSize.getHeight();
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8);
+
+      doc.text(
+        `Ariramba Jiu-Jitsu School - ${competenciaFormatada}`,
+        12,
+        paginaAltura - 7
+      );
+
+      doc.text(
+        `Página ${pagina} de ${totalPaginas}`,
+        paginaLargura - 12,
+        paginaAltura - 7,
+        { align: "right" }
+      );
+    }
+
+    const competenciaArquivo = String(
+      competenciaSelecionada || "competencia"
+    ).replace(/[^0-9-]/g, "");
+
+    doc.save(`relatorio-pagamentos-ariramba-${competenciaArquivo}.pdf`);
+  }
   async function baixarCarteirinhaPDF(aluno) {
     if (!aluno) {
       alert("Aluno nao encontrado.");
@@ -3044,10 +3415,10 @@ function App() {
       contexto.fillText("JIU-JITSU SCHOOL", 250, 105);
 
       const imagemLogo = await carregarImagem(logo);
-      retanguloArredondado(78, 28, 100, 100, 12);
+      retanguloArredondado(68, 16, 120, 120, 12);
       contexto.fillStyle = "#ffffff";
       contexto.fill();
-      contexto.drawImage(imagemLogo, 86, 36, 84, 84);
+      contexto.drawImage(imagemLogo, 76, 24, 104, 104);
 
       if (fotoCarteira) {
         try {
@@ -3952,15 +4323,7 @@ function App() {
   );
 
   const pagamentosAguardando = alunos.filter(
-    (aluno) => {
-      const ultimoPagamento = obterUltimoPagamentoDoAluno(pagamentos, aluno.id);
-
-      if (ultimoPagamento) {
-        return ultimoPagamento.status === "Aguardando";
-      }
-
-      return aluno.statusPagamento === "Aguardando";
-    }
+    (aluno) => Boolean(obterPagamentoAguardandoAberto(aluno.id))
   );
 
   const cobrancasVencemEmBreve = alunos.filter((aluno) => {
@@ -4195,6 +4558,7 @@ function App() {
     return new Date(ano, mes - 1, dia);
   }
 
+
   function pagamentoDoMesAtual(aluno) {
     const ultimoPagamento = dataBrasilParaDate(aluno?.ultimoPagamento);
     const agora = new Date();
@@ -4207,6 +4571,10 @@ function App() {
   }
 
   function pagamentoNoCicloAtual(pagamento) {
+    if (pagamento?.competencia) {
+      return pagamento.competencia === obterCompetenciaAtual();
+    }
+
     const dataPagamento = dataBrasilParaDate(
       pagamento?.data_pagamento || pagamento?.criado_em
     );
@@ -4219,6 +4587,36 @@ function App() {
     );
   }
 
+  function pagamentoPertenceCompetencia(pagamento, competencia) {
+    if (pagamento?.competencia) {
+      return pagamento.competencia === competencia;
+    }
+
+    const dataReferencia = String(
+      pagamento?.data_pagamento || pagamento?.criado_em || ""
+    ).slice(0, 7);
+
+    return dataReferencia === competencia;
+  }
+
+  function obterPagamentoDaCompetencia(idAluno, competencia, listaPagamentos = pagamentos) {
+    const prioridadeStatus = { Pago: 4, Rejeitado: 3, Aguardando: 2, Pendente: 1 };
+
+    return listaPagamentos
+      .filter((pagamento) =>
+        String(pagamento.aluno_id) === String(idAluno) &&
+        pagamentoPertenceCompetencia(pagamento, competencia)
+      )
+      .sort((a, b) => {
+        const diferencaPrioridade =
+          (prioridadeStatus[b.status] || 0) - (prioridadeStatus[a.status] || 0);
+
+        if (diferencaPrioridade !== 0) return diferencaPrioridade;
+
+        return dataPagamentoParaTempo(b) - dataPagamentoParaTempo(a);
+      })[0];
+  }
+
   function obterPagamentoAguardandoAberto(idAluno, listaPagamentos = pagamentos) {
     return listaPagamentos
       .filter((pagamento) =>
@@ -4227,6 +4625,56 @@ function App() {
         pagamentoNoCicloAtual(pagamento)
       )
       .sort((a, b) => dataPagamentoParaTempo(b) - dataPagamentoParaTempo(a))[0];
+  }
+
+  function obterPagamentoPagoNoCicloAtual(idAluno, listaPagamentos = pagamentos) {
+    return listaPagamentos
+      .filter((pagamento) =>
+        String(pagamento.aluno_id) === String(idAluno) &&
+        pagamento.status === "Pago" &&
+        pagamentoNoCicloAtual(pagamento)
+      )
+      .sort((a, b) => dataPagamentoParaTempo(b) - dataPagamentoParaTempo(a))[0];
+  }
+
+  function obterStatusNaCompetencia(aluno, competencia) {
+    const pagamento = obterPagamentoDaCompetencia(aluno.id, competencia);
+
+    if (pagamento?.status === "Pago") return "Pago";
+    if (pagamento?.status === "Aguardando") return "Aguardando";
+
+    const [ano, mes] = String(competencia).split("-").map(Number);
+    const diaVencimento = Number(aluno?.vencimento || DIA_COBRANCA_PADRAO);
+    const ultimoDiaDoMes = new Date(ano, mes, 0).getDate();
+    const vencimento = new Date(ano, mes - 1, Math.min(diaVencimento, ultimoDiaDoMes));
+
+    return obterDataSemHora() > vencimento ? "Vencido" : "Pendente";
+  }
+
+  function obterResumoCompetencia(competencia) {
+    const detalhes = alunos.map((aluno) => {
+      const pagamento = obterPagamentoDaCompetencia(aluno.id, competencia);
+      const status = obterStatusNaCompetencia(aluno, competencia);
+      const mensalidade = Number(aluno.mensalidade || 0);
+      const valorPago = pagamento?.status === "Pago" ? Number(pagamento.valor || 0) : 0;
+
+      return { aluno, pagamento, status, mensalidade, valorPago };
+    });
+
+    const previsto = detalhes.reduce((total, item) => total + item.mensalidade, 0);
+    const recebido = detalhes.reduce((total, item) => total + item.valorPago, 0);
+
+    return {
+      competencia,
+      detalhes,
+      previsto,
+      recebido,
+      restante: Math.max(0, previsto - recebido),
+      pagos: detalhes.filter((item) => item.status === "Pago").length,
+      pendentes: detalhes.filter((item) => item.status === "Pendente").length,
+      vencidos: detalhes.filter((item) => item.status === "Vencido").length,
+      aguardando: detalhes.filter((item) => item.status === "Aguardando").length,
+    };
   }
 
   function obterDataVencimentoAtual(aluno) {
@@ -4356,7 +4804,7 @@ function App() {
       return "Aguardando";
     }
 
-    if (aluno.statusPagamento === "Pago" && pagamentoDoMesAtual(aluno)) {
+    if (aluno.statusPagamento === "Pago" && (supabaseConfigurado || pagamentoDoMesAtual(aluno))) {
       return "Pago";
     }
 
@@ -4473,12 +4921,22 @@ function App() {
             onChange={(e) => setUsuario(e.target.value)}
           />
 
+          <div className="campoSenhaLogin">
           <input
-            type="password"
+            type={mostrarSenhaLogin ? "text" : "password"}
             placeholder="Senha"
             value={senha}
             onChange={(e) => setSenha(e.target.value)}
           />
+            <button
+              type="button"
+              className="botaoMostrarSenha"
+              onClick={() => setMostrarSenhaLogin((valorAtual) => !valorAtual)}
+              aria-label={mostrarSenhaLogin ? "Ocultar senha" : "Mostrar senha"}
+            >
+              <svg className="iconeOlhoSenha" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z" fill="none" stroke="currentColor" strokeWidth="2"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" strokeWidth="2"/></svg>
+            </button>
+          </div>
 
           <button
             onClick={fazerLogin}
@@ -4503,6 +4961,7 @@ function App() {
           <Menu
             setTela={setTela}
             tipoUsuario={tipoUsuario}
+            limparFormulario={limparFormulario}
             setMenuAberto={setMenuAberto}
             onSair={sairDoSistema}
           />
@@ -4576,6 +5035,7 @@ function App() {
           <Menu
             setTela={setTela}
             tipoUsuario={tipoUsuario}
+            limparFormulario={limparFormulario}
             setMenuAberto={setMenuAberto}
             onSair={sairDoSistema}
           />
@@ -4828,6 +5288,7 @@ function App() {
           <Menu
             setTela={setTela}
             tipoUsuario={tipoUsuario}
+            limparFormulario={limparFormulario}
             setMenuAberto={setMenuAberto}
             onSair={sairDoSistema}
           />
@@ -5068,6 +5529,7 @@ function App() {
           <Menu
             setTela={setTela}
             tipoUsuario={tipoUsuario}
+            limparFormulario={limparFormulario}
             setMenuAberto={setMenuAberto}
             onSair={sairDoSistema}
           />
@@ -5225,6 +5687,8 @@ function App() {
   }
 
   if (tela === "pagamentos") {
+    const resumoCompetencia = obterResumoCompetencia(competenciaSelecionada);
+
     return (
       <div className="layoutSistema">
 
@@ -5241,6 +5705,7 @@ function App() {
             <Menu
               setTela={setTela}
               tipoUsuario={tipoUsuario}
+              limparFormulario={limparFormulario}
               setMenuAberto={setMenuAberto}
               onSair={sairDoSistema}
             />
@@ -5254,6 +5719,53 @@ function App() {
             ☰
           </button>
           <TituloTela titulo="Controle de Pagamentos" />
+
+          <div className="seletorCompetenciaFinanceiro">
+            <label htmlFor="competenciaFinanceiro">Competencia</label>
+            <input
+              id="competenciaFinanceiro"
+              type="month"
+              value={competenciaSelecionada}
+              onChange={(e) => setCompetenciaSelecionada(e.target.value)}
+            />
+            <strong>{formatarCompetencia(competenciaSelecionada)}</strong>
+          </div>
+
+          <div className="resumoCompetenciaFinanceiro">
+            <div className="cardEstatistica">
+              <h3>Previsto</h3>
+              <h2>{formatarMoeda(resumoCompetencia.previsto)}</h2>
+            </div>
+            <div className="cardEstatistica">
+              <h3>Recebido</h3>
+              <h2>{formatarMoeda(resumoCompetencia.recebido)}</h2>
+            </div>
+            <div className="cardEstatistica">
+              <h3>Restante</h3>
+              <h2>{formatarMoeda(resumoCompetencia.restante)}</h2>
+            </div>
+            <div className="cardEstatistica">
+              <h3>Pagos</h3>
+              <h2>{resumoCompetencia.pagos}</h2>
+            </div>
+            <div className="cardEstatistica">
+              <h3>Pendentes</h3>
+              <h2>{resumoCompetencia.pendentes}</h2>
+            </div>
+            <div className="cardEstatistica">
+              <h3>Vencidos</h3>
+              <h2>{resumoCompetencia.vencidos}</h2>
+            </div>
+            <div className="cardEstatistica">
+              <h3>Aguardando</h3>
+              <h2>{resumoCompetencia.aguardando}</h2>
+            </div>
+          </div>
+
+          <button onClick={gerarRelatorioPagamentosPDF}>
+            Gerar Relatório de Pagamentos PDF
+          </button>
+
           <div className="cardEstatistica">
             <h3>Aguardando Confirmação</h3>
 
@@ -5432,6 +5944,7 @@ function App() {
             <Menu
               setTela={setTela}
               tipoUsuario={tipoUsuario}
+              limparFormulario={limparFormulario}
               setMenuAberto={setMenuAberto}
               onSair={sairDoSistema}
             />
@@ -5549,6 +6062,7 @@ function App() {
           <Menu
             setTela={setTela}
             tipoUsuario={tipoUsuario}
+            limparFormulario={limparFormulario}
             setMenuAberto={setMenuAberto}
             onSair={sairDoSistema}
           />
@@ -5637,6 +6151,7 @@ function App() {
             <Menu
               setTela={setTela}
               tipoUsuario={tipoUsuario}
+              limparFormulario={limparFormulario}
               setMenuAberto={setMenuAberto}
               onSair={sairDoSistema}
             />
@@ -5901,6 +6416,7 @@ function App() {
             <Menu
               setTela={setTela}
               tipoUsuario={tipoUsuario}
+              limparFormulario={limparFormulario}
               setMenuAberto={setMenuAberto}
               onSair={sairDoSistema}
             />
@@ -6158,7 +6674,7 @@ function App() {
               <span>
                 {nomeComprovanteSelecionado || "Nenhum comprovante selecionado"}
               </span>
-              <small>Imagem ou PDF do comprovante</small>
+              <small>PDF, JPG, JPEG ou PNG, até 5 MiB</small>
               <input
                 id="comprovantePagamentoAluno"
                 type="file"
@@ -6167,16 +6683,18 @@ function App() {
 
                   const arquivo = e.target.files[0];
 
+                  setComprovanteSelecionado(null);
+                  setNomeComprovanteSelecionado("");
                   if (arquivo) {
+                    try {
+                      validarComprovante(arquivo);
+                    } catch (error) {
+                      e.target.value = "";
+                      abrirModalMensagem({ tipo: "erro", titulo: "Comprovante inválido", mensagem: error.message });
+                      return;
+                    }
                     setNomeComprovanteSelecionado(arquivo.name);
-
-                    const leitor = new FileReader();
-
-                    leitor.onloadend = () => {
-                      setComprovanteSelecionado(leitor.result);
-                    };
-
-                    leitor.readAsDataURL(arquivo);
+                    setComprovanteSelecionado(arquivo);
                   }
                 }}
               />
@@ -6311,6 +6829,7 @@ function App() {
           <Menu
             setTela={setTela}
             tipoUsuario={tipoUsuario}
+            limparFormulario={limparFormulario}
             setMenuAberto={setMenuAberto}
             onSair={sairDoSistema}
           />
@@ -6394,6 +6913,7 @@ function App() {
           <Menu
             setTela={setTela}
             tipoUsuario={tipoUsuario}
+            limparFormulario={limparFormulario}
             setMenuAberto={setMenuAberto}
             onSair={sairDoSistema}
           />
@@ -6976,7 +7496,9 @@ function App() {
     return <h3>{children}</h3>;
   }
 
-  function Menu({ setTela, tipoUsuario, setMenuAberto, onSair }) {
+}
+
+  function Menu({ setTela, tipoUsuario, setMenuAberto, limparFormulario, onSair }) {
 
     function navegar(telaDestino) {
       setTela(telaDestino);
@@ -7062,6 +7584,22 @@ function App() {
     );
   }
 
-}
 
 export default App;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
